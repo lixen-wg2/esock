@@ -1,0 +1,18 @@
+{application, esock, [
+    {description, "Shared SCTP socket and association library"},
+    {vsn, "0.3.0"},
+    {registered, [esock_sup, esock_socket_sup, esock_registry]},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {mod, {esock_app, []}},
+    {files, [
+        "src",
+        "rebar.config"
+    ]},
+    {exclude_patterns, []},
+    %% hex.pm stuff
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/lixen-wg2/esock"}]}
+]}.
