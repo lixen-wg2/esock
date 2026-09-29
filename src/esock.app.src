@@ -1,0 +1,10 @@
+{application, esock, [
+    {description, "Shared SCTP socket and association library"},
+    {vsn, "0.3.0"},
+    {registered, [esock_sup, esock_socket_sup, esock_registry]},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {mod, {esock_app, []}}
+]}.
