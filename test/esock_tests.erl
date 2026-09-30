@@ -39,6 +39,12 @@ pending_accept_is_limited_to_acceptor_test_() ->
 direct_association_owner_test_() ->
     test_case(fun direct_association_owner/0).
 
+peeled_close_notifies_peer_test_() ->
+    test_case(fun peeled_close_notifies_peer/0).
+
+peeled_socket_close_notifies_peer_test_() ->
+    socket_test_case(fun() -> peeled_close_notifies_peer(socket) end).
+
 isolated_association_owners_test_() ->
     test_case(fun isolated_association_owners/0).
 
@@ -359,6 +365,28 @@ isolated_association_owners() ->
         remote_addrs => [?LOOPBACK],
         remote_port => ClientPort1
     }),
+peeled_close_notifies_peer() ->
+    peeled_close_notifies_peer(gen_sctp).
+
+peeled_close_notifies_peer(Backend) ->
+    ListenPort = free_port(),
+    ClientPort = free_port(),
+    {ok, Socket} = esock:open(#{
+        backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort
+    }),
+    {ok, Peer} = esock:register_peer(Socket, #{
+        remote_addrs => [?LOOPBACK], remote_port => ClientPort
+    }),
+    {ok, Client} = client_socket(ClientPort),
+    _AssocId = connect_client(Client, ListenPort),
+    {Pending, _Info} = receive_pending(Peer),
+    {ok, Assoc} = esock:accept(Socket, Pending, self()),
+    ok = esock:close(Assoc),
+    ?assertMatch({ok, {_, _, [], #sctp_shutdown_event{}}},
+        sctp_recv(Client, ?TIMEOUT)),
+    ok = gen_sctp:close(Client),
+    ok = esock:release(Socket).
+
     {ok, Peer2} = esock:register_peer(Socket, #{
         remote_addrs => [?LOOPBACK],
         remote_port => ClientPort2
