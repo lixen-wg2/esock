@@ -4,7 +4,7 @@
 
 -export([
     supported/0,
-    open/3,
+    open/4,
     close/1,
     arm_listener/1,
     listener_message/2,
@@ -26,9 +26,9 @@
 -define(RECV_STATE(Socket), {?MODULE, recv_state, Socket}).
 -define(RECV_CTRL_SIZE, 1024).
 
-open(LocalAddrs, LocalPort, Options) ->
+open(LocalAddrs, LocalPort, Options, StartListening) ->
     case supported() of
-        true -> open_socket(LocalAddrs, LocalPort, Options);
+        true -> open_socket(LocalAddrs, LocalPort, Options, StartListening);
         false -> {error, {unsupported_backend, socket}}
     end.
 
@@ -45,11 +45,11 @@ supported() ->
             false
     end.
 
-open_socket(LocalAddrs, LocalPort, Options) ->
+open_socket(LocalAddrs, LocalPort, Options, StartListening) ->
     Domain = address_domain(hd(LocalAddrs)),
     case socket:open(Domain, seqpacket, sctp, #{use_registry => false}) of
         {ok, Socket} ->
-            case prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options) of
+            case prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options, StartListening) of
                 {ok, ActualAddrs, ActualPort} ->
                     {ok, Socket, ActualAddrs, ActualPort};
                 {error, _} = Error ->
@@ -60,14 +60,18 @@ open_socket(LocalAddrs, LocalPort, Options) ->
             {error, {open, Reason}}
     end.
 
-prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options) ->
+prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options, StartListening) ->
     case set_events(Socket) of
         ok ->
             case setopts(Socket, Options) of
                 ok ->
                     case bind_addresses(Socket, Domain, LocalAddrs, LocalPort) of
                         ok ->
-                            case socket:listen(Socket, true) of
+                            ListenResult = case StartListening of
+                                true -> socket:listen(Socket, true);
+                                false -> ok
+                            end,
+                            case ListenResult of
                                 ok -> socket_names(Socket, LocalAddrs, LocalPort);
                                 {error, Reason} -> {error, {listen, Reason}}
                             end;

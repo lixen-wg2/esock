@@ -51,6 +51,18 @@ isolated_association_owners_test_() ->
 late_peer_registration_test_() ->
     test_case(fun late_peer_registration/0).
 
+explicit_listener_test_() ->
+    test_case(fun explicit_listener/0).
+
+shared_listener_lease_test_() ->
+    test_case(fun shared_listener_lease/0).
+
+socket_shared_listener_lease_test_() ->
+    socket_test_case(fun() -> shared_listener_lease(socket) end).
+
+reject_unmatched_association_test_() ->
+    test_case(fun reject_unmatched_association/0).
+
 pending_association_timeout_test_() ->
     test_case(fun pending_association_timeout/0).
 
@@ -172,6 +184,16 @@ socket_configuration_conflict() ->
             local_addrs => [?LOOPBACK],
             local_port => Port,
             pending_timeout => 200
+        })
+    ),
+    ?assertMatch(
+        {error, {socket_option_conflict,
+            #{reject_unmatched := false}, #{reject_unmatched := true}}},
+        esock:open(#{
+            local_addrs => [?LOOPBACK],
+            local_port => Port,
+            pending_timeout => 100,
+            reject_unmatched => true
         })
     ),
     ok = esock:release(Socket).
@@ -356,15 +378,6 @@ direct_association_owner() ->
     ok = gen_sctp:close(Client),
     ok = esock:release(Socket).
 
-isolated_association_owners() ->
-    ListenPort = free_port(),
-    ClientPort1 = free_port(),
-    ClientPort2 = free_port(),
-    {ok, Socket} = esock:open(#{local_addrs => [?LOOPBACK], local_port => ListenPort}),
-    {ok, Peer1} = esock:register_peer(Socket, #{
-        remote_addrs => [?LOOPBACK],
-        remote_port => ClientPort1
-    }),
 peeled_close_notifies_peer() ->
     peeled_close_notifies_peer(gen_sctp).
 
@@ -387,6 +400,15 @@ peeled_close_notifies_peer(Backend) ->
     ok = gen_sctp:close(Client),
     ok = esock:release(Socket).
 
+isolated_association_owners() ->
+    ListenPort = free_port(),
+    ClientPort1 = free_port(),
+    ClientPort2 = free_port(),
+    {ok, Socket} = esock:open(#{local_addrs => [?LOOPBACK], local_port => ListenPort}),
+    {ok, Peer1} = esock:register_peer(Socket, #{
+        remote_addrs => [?LOOPBACK],
+        remote_port => ClientPort1
+    }),
     {ok, Peer2} = esock:register_peer(Socket, #{
         remote_addrs => [?LOOPBACK],
         remote_port => ClientPort2
@@ -433,6 +455,89 @@ late_peer_registration() ->
     {Pending, _Info} = receive_pending(Peer),
     {ok, Assoc} = esock:accept(Socket, Pending, self()),
     close_all([Assoc], [Client], Socket).
+
+explicit_listener() ->
+    ListenPort = free_port(),
+    ClientPort = free_port(),
+    {ok, Socket} = esock:open(#{
+        local_addrs => [?LOOPBACK], local_port => ListenPort,
+        start_listening => false, reject_unmatched => true
+    }),
+    {ok, ClosedClient} = client_socket(free_port()),
+    assert_cannot_connect(ClosedClient, ListenPort),
+    ok = gen_sctp:close(ClosedClient),
+    {ok, Peer} = esock:register_peer(Socket, #{
+        remote_addrs => [?LOOPBACK], remote_port => ClientPort
+    }),
+    ok = esock:listen(Socket, true),
+    {ok, Client} = client_socket(ClientPort),
+    AssocId = connect_client(Client, ListenPort),
+    {Pending, _Info} = receive_pending(Peer),
+    {ok, Assoc} = esock:accept(Socket, Pending, self()),
+    ok = esock:listen(Socket, false),
+    ?assertEqual({error, {invalid_listen_state, invalid}}, esock:listen(Socket, invalid)),
+    ok = client_send(Client, AssocId, 46, <<"still-open">>),
+    ok = esock:activate(Assoc, once),
+    ?assertMatch({ok, {data, #{ppid := 46}, <<"still-open">>}}, receive_data(Assoc)),
+    close_all([Assoc], [Client], Socket).
+
+shared_listener_lease() ->
+    shared_listener_lease(gen_sctp).
+
+shared_listener_lease(Backend) ->
+    ListenPort = free_port(),
+    {ok, Socket1} = esock:open(#{
+        backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort,
+        start_listening => false
+    }),
+    {ok, Socket2} = esock:open(#{
+        backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort,
+        start_listening => true
+    }),
+    ?assertEqual(esock:socket_id(Socket1), esock:socket_id(Socket2)),
+    ok = esock:listen(Socket1, true),
+    ok = esock:listen(Socket2, true),
+    ok = esock:listen(Socket1, false),
+    {ok, Client} = client_socket(free_port()),
+    _AssocId = connect_client(Client, ListenPort),
+    ok = gen_sctp:close(Client),
+    ok = esock:listen(Socket2, false),
+    {ok, Client2} = client_socket(free_port()),
+    assert_cannot_connect(Client2, ListenPort),
+    ok = gen_sctp:close(Client2),
+    ok = esock:release(Socket1),
+    ok = esock:release(Socket2).
+
+reject_unmatched_association() ->
+    ListenPort = free_port(),
+    ClientPort = free_port(),
+    {ok, Socket} = esock:open(#{
+        local_addrs => [?LOOPBACK], local_port => ListenPort,
+        reject_unmatched => true
+    }),
+    {ok, Client} = client_socket(ClientPort),
+    _AssocId = connect_client(Client, ListenPort),
+    ?assertMatch({ok, {_, _, [], #sctp_shutdown_event{}}},
+        sctp_recv(Client, ?TIMEOUT)),
+    {ok, Peer} = esock:register_peer(Socket, #{
+        remote_addrs => [?LOOPBACK], remote_port => ClientPort
+    }),
+    receive
+        {esock, Peer, {association, _Socket, _Pending, _Info}} ->
+            error(unmatched_association_was_retained)
+    after 100 -> ok
+    end,
+    ok = esock:unregister_peer(Socket, Peer),
+    ok = gen_sctp:close(Client),
+    ok = esock:release(Socket).
+
+assert_cannot_connect(Client, Port) ->
+    case gen_sctp:connect(Client, ?LOOPBACK, Port, [], 500) of
+        {ok, #sctp_assoc_change{state = comm_up}} -> error(unexpected_connection);
+        {ok, {_, _, _, #sctp_assoc_change{state = comm_up}}} ->
+            error(unexpected_connection);
+        _ -> ok
+    end.
 
 pending_association_timeout() ->
     ListenPort = free_port(),
@@ -987,6 +1092,16 @@ invalid_socket_options() ->
     ?assertMatch(
         {error, {invalid_socket_options, _}},
         invalid_esock_call(open, [#{pending_timeout => 0}])
+    ),
+    ?assertMatch(
+        {error, {invalid_socket_options,
+            #{start_listening := invalid, reject_unmatched := false}}},
+        invalid_esock_call(open, [#{start_listening => invalid}])
+    ),
+    ?assertMatch(
+        {error, {invalid_socket_options,
+            #{start_listening := true, reject_unmatched := invalid}}},
+        invalid_esock_call(open, [#{reject_unmatched => invalid}])
     ),
     {ok, Socket} = esock:open(#{local_addrs => [?LOOPBACK], local_port => free_port()}),
     ?assertMatch(

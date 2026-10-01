@@ -13,6 +13,7 @@
     normalize_config/1,
     acquire/3,
     release/2,
+    listen/3,
     socknames/1,
     register_peer/4,
     unregister_peer/3,
@@ -77,6 +78,8 @@
     local_addrs :: [inet:ip_address()],
     local_port :: inet:port_number(),
     leases = #{} :: #{reference() => {pid(), reference()}},
+    listening_leases = #{} :: #{reference() => true},
+    listening = true :: boolean(),
     routes = [] :: [#route{}],
     pending = #{} :: #{reference() => #pending{}},
     pending_order :: queue:queue(reference()),
@@ -95,11 +98,12 @@ normalize_config(Options) when is_map(Options) ->
     PendingTimeout = maps:get(pending_timeout, Options, ?DEFAULT_PENDING_TIMEOUT),
     MaxPending = maps:get(max_pending, Options, ?DEFAULT_MAX_PENDING),
     Backend = maps:get(backend, Options, gen_sctp),
-    case
-        normalize_local_config(
-            LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend
-        )
-    of
+    StartListening = maps:get(start_listening, Options, true),
+    RejectUnmatched = maps:get(reject_unmatched, Options, false),
+    case normalize_local_config(
+        LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
+        StartListening, RejectUnmatched
+    ) of
         {ok, LocalAddrs} ->
             case backend_supported(Backend) of
                 true ->
@@ -115,7 +119,9 @@ normalize_config(Options) when is_map(Options) ->
                         local_port => LocalPort,
                         socket_options => SocketOptions,
                         pending_timeout => PendingTimeout,
-                        max_pending => MaxPending
+                        max_pending => MaxPending,
+                        start_listening => StartListening,
+                        reject_unmatched => RejectUnmatched
                     },
                     {ok, Key, Config};
                 false ->
@@ -135,6 +141,9 @@ acquire(Pid, Owner, Config) ->
 
 release(Pid, Lease) ->
     call(Pid, {release, Lease}).
+
+listen(Pid, Lease, Enabled) ->
+    call(Pid, {listen, Lease, Enabled}).
 
 socknames(Pid) ->
     call(Pid, socknames).
@@ -164,6 +173,7 @@ init(Config) ->
                 local_addrs = LocalAddrs,
                 local_port = LocalPort,
                 pending_order = queue:new(),
+                listening = maps:get(start_listening, Config),
                 backend = maps:get(backend, Config)
             },
             {ok, rearm(State)};
@@ -177,14 +187,38 @@ handle_call({acquire, Owner, Config}, _From, State0) ->
             Lease = make_ref(),
             Monitor = erlang:monitor(process, Owner),
             Leases = (State0#state.leases)#{Lease => {Owner, Monitor}},
-            State = cancel_stop(State0#state{leases = Leases}),
-            {reply, {ok, #esock_socket_ref{pid = self(), lease = Lease}}, State};
+            ListeningLeases = case maps:get(start_listening, Config) of
+                true -> (State0#state.listening_leases)#{Lease => true};
+                false -> State0#state.listening_leases
+            end,
+            Candidate = State0#state{leases = Leases, listening_leases = ListeningLeases},
+            case sync_listening(Candidate) of
+                {ok, State} ->
+                    {reply, {ok, #esock_socket_ref{pid = self(), lease = Lease}}, cancel_stop(State)};
+                {error, Reason} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    {reply, {error, {listen, Reason}}, State0}
+            end;
         false ->
             {reply, {error, {socket_option_conflict, State0#state.config, Config}}, State0}
     end;
 handle_call({release, Lease}, _From, State0) ->
     State = maybe_schedule_stop(remove_lease(Lease, State0)),
     {reply, ok, State};
+handle_call({listen, Lease, Enabled}, _From, State0) ->
+    case maps:is_key(Lease, State0#state.leases) of
+        false ->
+            {reply, {error, invalid_lease}, State0};
+        true ->
+            ListeningLeases = case Enabled of
+                true -> (State0#state.listening_leases)#{Lease => true};
+                false -> maps:remove(Lease, State0#state.listening_leases)
+            end,
+            case sync_listening(State0#state{listening_leases = ListeningLeases}) of
+                {ok, State} -> {reply, ok, State};
+                {error, Reason} -> {reply, {error, {listen, Reason}}, State0}
+            end
+    end;
 handle_call(socknames, _From, State) ->
     Reply = {ok, {State#state.local_addrs, State#state.local_port}},
     {reply, Reply, State};
@@ -377,7 +411,8 @@ call(Pid, Request) ->
     end.
 
 normalize_local_config(
-    LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend
+    LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
+    StartListening, RejectUnmatched
 ) when
     is_list(LocalAddrs0),
     LocalAddrs0 =/= [],
@@ -386,6 +421,8 @@ normalize_local_config(
     LocalPort =< 65535,
     is_list(SocketOptions),
     (Backend =:= gen_sctp orelse Backend =:= socket),
+    is_boolean(StartListening),
+    is_boolean(RejectUnmatched),
     (is_integer(PendingTimeout) andalso 0 < PendingTimeout) orelse PendingTimeout =:= infinity,
     (is_integer(MaxPending) andalso 0 < MaxPending) orelse MaxPending =:= infinity
 ->
@@ -399,7 +436,8 @@ normalize_local_config(
             Error
     end;
 normalize_local_config(
-    LocalAddrs, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend
+    LocalAddrs, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
+    StartListening, RejectUnmatched
 ) ->
     {error,
         {invalid_socket_options, #{
@@ -408,7 +446,9 @@ normalize_local_config(
             socket_options => SocketOptions,
             pending_timeout => PendingTimeout,
             max_pending => MaxPending,
-            backend => Backend
+            backend => Backend,
+            start_listening => StartListening,
+            reject_unmatched => RejectUnmatched
         }}}.
 
 normalize_addresses(Addrs) ->
@@ -482,7 +522,10 @@ valid_socket_options(Options) ->
     ).
 
 compatible(New, Existing) ->
-    Keys = [backend, local_addrs, local_port, socket_options, pending_timeout, max_pending],
+    Keys = [
+        backend, local_addrs, local_port, socket_options, pending_timeout, max_pending,
+        reject_unmatched
+    ],
     maps:with(Keys, New) =:= maps:with(Keys, Existing).
 
 open(Config) ->
@@ -499,7 +542,11 @@ open_gen_sctp(Config) ->
     Options = [binary, {active, once}, {port, LocalPort} | AddressOptions ++ UserOptions],
     case gen_sctp:open(Options) of
         {ok, Socket} ->
-            case gen_sctp:listen(Socket, true) of
+            ListenResult = case maps:get(start_listening, Config) of
+                true -> gen_sctp:listen(Socket, true);
+                false -> ok
+            end,
+            case ListenResult of
                 ok ->
                     case socket_names(Socket, LocalAddrs, LocalPort) of
                         {ok, ActualAddrs, ActualPort} ->
@@ -520,7 +567,8 @@ open_socket_api(Config) ->
     esock_socket_api:open(
         maps:get(local_addrs, Config),
         maps:get(local_port, Config),
-        maps:get(socket_options, Config)
+        maps:get(socket_options, Config),
+        maps:get(start_listening, Config)
     ).
 
 socket_names(Socket, ConfiguredAddrs, ConfiguredPort) ->
@@ -993,7 +1041,8 @@ queue_incoming(AssocSocket, Change, Info, State0) ->
             close_socket(State0#state.backend, AssocSocket),
             State0;
         false ->
-            case pending_limit_reached(State0) of
+            case maps:get(reject_unmatched, State0#state.config) orelse
+                pending_limit_reached(State0) of
                 true ->
                     cancel_timer(Timer),
                     close_socket(State0#state.backend, AssocSocket),
@@ -1192,8 +1241,17 @@ remove_lease(Lease, State0) ->
              || {Ref, Pending} <- maps:to_list(State0#state.pending),
                 Pending#pending.lease =:= Lease
             ],
-            State1 = StateWithConnects#state{leases = Leases, routes = Routes},
-            maybe_start_queued(lists:foldl(fun drop_pending/2, State1, PendingRefs));
+            ListeningLeases = maps:remove(Lease, State0#state.listening_leases),
+            State1 = StateWithConnects#state{
+                leases = Leases, routes = Routes, listening_leases = ListeningLeases
+            },
+            State2 = maybe_start_queued(lists:foldl(fun drop_pending/2, State1, PendingRefs)),
+            case sync_listening(State2) of
+                {ok, State3} -> State3;
+                {error, Reason} ->
+                    logger:warning("Could not update SCTP listen state: ~p", [Reason]),
+                    State2
+            end;
         error ->
             State0
     end.
@@ -1235,6 +1293,20 @@ cancel_stop(#state{stop_timer = undefined} = State) ->
 cancel_stop(#state{stop_timer = {_StopRef, TimerRef}} = State) ->
     erlang:cancel_timer(TimerRef),
     State#state{stop_timer = undefined}.
+
+sync_listening(#state{listening = Listening, listening_leases = Leases} = State) ->
+    Enabled = map_size(Leases) > 0,
+    case Enabled =:= Listening of
+        true -> {ok, State};
+        false ->
+            case set_listening(State#state.backend, State#state.socket, Enabled) of
+                ok -> {ok, State#state{listening = Enabled}};
+                {error, _} = Error -> Error
+            end
+    end.
+
+set_listening(gen_sctp, Socket, Enabled) -> gen_sctp:listen(Socket, Enabled);
+set_listening(socket, Socket, Enabled) -> socket:listen(Socket, Enabled).
 
 rearm(#state{backend = gen_sctp, socket = Socket} = State) ->
     case inet:setopts(Socket, [{active, once}]) of

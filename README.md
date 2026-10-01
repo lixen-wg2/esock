@@ -65,6 +65,29 @@ Start the application and acquire a listening socket:
 Calls with the same non-zero local address set and port acquire separate leases
 on the same socket. Port `0` always creates a distinct socket.
 
+By default the socket listens immediately. An endpoint that must reject SCTP
+connections while disabled can start paused and control its lease explicitly:
+
+```erlang
+{ok, Socket} = esock:open(#{
+    local_addrs => [{127, 0, 0, 1}],
+    local_port => 3868,
+    start_listening => false,
+    reject_unmatched => true
+}),
+{ok, Peer} = esock:register_peer(Socket, PeerOptions),
+ok = esock:listen(Socket, true),
+ok = esock:listen(Socket, false),
+ok = esock:unregister_peer(Socket, Peer).
+```
+
+The shared socket listens while at least one lease is enabled. `start_listening`
+sets each lease's initial state and is deliberately excluded from the socket
+compatibility check, so leases may choose different values.
+`reject_unmatched => true` closes incoming associations with no registered
+peer, regardless of which lease enabled listening. All leases on a shared
+socket must agree on `reject_unmatched` and the other socket-wide options.
+
 Unmatched incoming associations are retained only until `pending_timeout`, which
 defaults to 10 seconds. The unmatched pending backlog is also capped by
 `max_pending`, which defaults to 1024; associations above the cap are closed.

@@ -15,6 +15,7 @@ the association owner; payload does not pass through the shared socket process.
 -export([
     open/1,
     release/1,
+    listen/2,
     socknames/1,
     socket_id/1,
     register_peer/2,
@@ -60,7 +61,9 @@ the association owner; payload does not pass through the shared socket process.
     local_port => port_number(),
     socket_options => [gen_sctp:option()],
     pending_timeout => pos_integer() | infinity,
-    max_pending => pos_integer() | infinity
+    max_pending => pos_integer() | infinity,
+    start_listening => boolean(),
+    reject_unmatched => boolean()
 }.
 
 -type peer_options() :: #{
@@ -127,6 +130,13 @@ open(Options) ->
 -spec release(socket_ref()) -> ok | {error, term()}.
 release(#esock_socket_ref{pid = Pid, lease = Lease}) ->
     esock_socket:release(Pid, Lease).
+
+-doc "Set whether this lease accepts incoming SCTP associations.".
+-spec listen(socket_ref(), boolean()) -> ok | {error, term()}.
+listen(#esock_socket_ref{pid = Pid, lease = Lease}, Enabled) when is_boolean(Enabled) ->
+    esock_socket:listen(Pid, Lease, Enabled);
+listen(#esock_socket_ref{}, Enabled) ->
+    {error, {invalid_listen_state, Enabled}}.
 
 -doc "Return all local addresses and their common port.".
 -spec socknames(socket_ref()) -> {ok, {[inet:ip_address()], port_number()}} | {error, term()}.
