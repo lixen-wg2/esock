@@ -40,12 +40,15 @@ the association owner; payload does not pass through the shared socket process.
     port_number/0,
     socket_ref/0,
     association/0,
+    socket_option/0,
+    active_mode/0,
     socket_options/0,
     peer_options/0,
     connect_options/0,
     send_options/0,
     peer_info/0,
     association_info/0,
+    message_metadata/0,
     decoded_message/0,
     decoded_sctp_message/0
 ]).
@@ -53,13 +56,17 @@ the association owner; payload does not pass through the shared socket process.
 -type address() :: inet:ip_address() | loopback | any.
 -type port_number() :: inet:port_number().
 -opaque socket_ref() :: #esock_socket_ref{}.
--opaque association() :: #esock_assoc_ref{}.
+-opaque association() :: esock_assoc().
+
+-type active_mode() :: false | true | once | pos_integer().
+%% The socket backend implements positive active counts without inet's limit.
+-type socket_option() :: gen_sctp:option() | {active, active_mode()}.
 
 -type socket_options() :: #{
     backend => gen_sctp | socket,
     local_addrs => [address()],
     local_port => port_number(),
-    socket_options => [gen_sctp:option()],
+    socket_options => [socket_option()],
     pending_timeout => pos_integer() | infinity,
     max_pending => pos_integer() | infinity,
     start_listening => boolean(),
@@ -76,7 +83,7 @@ the association owner; payload does not pass through the shared socket process.
     remote_addrs := [address()],
     remote_port := port_number(),
     owner => pid(),
-    connect_options => [gen_sctp:option()]
+    connect_options => [socket_option()]
 }.
 
 -type send_options() :: #{
@@ -96,10 +103,10 @@ the association owner; payload does not pass through the shared socket process.
     outbound_streams := non_neg_integer()
 }.
 
--type association_info() :: #{
-    backend := gen_sctp | socket,
-    assoc_id := non_neg_integer(),
-    socket := term(),
+-type association_info(Backend, Socket, AssocId) :: #{
+    backend := Backend,
+    assoc_id := AssocId,
+    socket := Socket,
     local_addrs := [inet:ip_address()],
     local_port := port_number(),
     remote_addrs := [inet:ip_address()],
@@ -108,12 +115,26 @@ the association owner; payload does not pass through the shared socket process.
     outbound_streams := non_neg_integer()
 }.
 
+-type association_info() ::
+    association_info(gen_sctp, gen_sctp:sctp_socket(), gen_sctp:assoc_id())
+    | association_info(socket, socket:socket(), integer()).
+
+-type message_metadata() :: #{
+    remote_addr := inet:ip_address() | undefined,
+    remote_port := port_number(),
+    stream := non_neg_integer(),
+    ppid := non_neg_integer(),
+    context := non_neg_integer(),
+    flags := [atom()],
+    assoc_id := gen_sctp:assoc_id()
+}.
+
 -type decoded_message() ::
-    {data, map(), binary()}
+    {data, message_metadata(), binary()}
     | {event, term()}.
 
 -type decoded_sctp_message() ::
-    {data, inet:ip_address(), inet:port_number(), #sctp_sndrcvinfo{}, binary()}
+    {data, inet:ip_address() | undefined, port_number(), #sctp_sndrcvinfo{}, binary()}
     | {event, term()}.
 
 -doc """
@@ -188,7 +209,7 @@ The new owner must call `activate/2` after handoff to enable active delivery.
 An `active` option is rejected because it cannot be applied before the owner
 controls the socket.
 """.
--spec accept(socket_ref(), reference(), pid(), [gen_sctp:option()]) ->
+-spec accept(socket_ref(), reference(), pid(), [socket_option()]) ->
     {ok, association()} | {error, term()}.
 accept(#esock_socket_ref{pid = Pid, lease = Lease}, PendingRef, Owner, Options) when
     is_pid(Owner), is_list(Options)
@@ -213,12 +234,12 @@ accept(#esock_socket_ref{}, PendingRef, Owner, Options) ->
         }}}.
 
 -doc "Configure active delivery on an association owned by the caller.".
--spec activate(association(), false | true | once | pos_integer()) -> ok | {error, term()}.
+-spec activate(association(), active_mode()) -> ok | {error, term()}.
 activate(Assoc, Active) ->
     setopts(Assoc, [{active, Active}]).
 
 -doc "Set options on a peeled association socket.".
--spec setopts(association(), [gen_sctp:option()]) -> ok | {error, term()}.
+-spec setopts(association(), [socket_option()]) -> ok | {error, term()}.
 setopts(#esock_assoc_ref{backend = gen_sctp, socket = Socket}, Options) when is_list(Options) ->
     inet:setopts(Socket, Options);
 setopts(#esock_assoc_ref{backend = socket, socket = Socket, assoc_id = AssocId}, Options) when

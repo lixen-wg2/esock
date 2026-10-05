@@ -45,8 +45,8 @@
 
 -record(pending, {
     ref :: reference(),
-    socket :: term(),
-    assoc_id :: non_neg_integer(),
+    socket :: backend_socket(),
+    assoc_id :: gen_sctp:assoc_id(),
     info :: esock:peer_info(),
     timer :: reference() | undefined,
     peer_ref = undefined :: reference() | undefined,
@@ -65,16 +65,16 @@
     remaining :: [inet:ip_address()],
     current :: inet:ip_address(),
     remote_port :: inet:port_number(),
-    options = [] :: [gen_sctp:option()],
-    errors = [] :: [term()],
+    options = [] :: [esock:socket_option()],
+    errors = [] :: [{inet:ip_address(), term()}],
     canceled = false :: boolean(),
     started = false :: boolean(),
-    async = undefined :: term()
+    async = undefined :: esock_socket_api:async_info() | undefined
 }).
 
 -record(state, {
-    config :: map(),
-    socket :: term(),
+    config :: config(),
+    socket :: backend_socket(),
     local_addrs :: [inet:ip_address()],
     local_port :: inet:port_number(),
     leases = #{} :: #{reference() => {pid(), reference()}},
@@ -84,13 +84,47 @@
     pending = #{} :: #{reference() => #pending{}},
     pending_order :: queue:queue(reference()),
     connects = [] :: [#connect{}],
-    stop_timer = undefined :: {reference(), reference()} | undefined,
-    backend = gen_sctp :: gen_sctp | socket
+    stop_timer = undefined :: {reference(), reference()} | undefined
 }).
 
+-type backend() :: gen_sctp | socket.
+%% Dialyzer retains unions with distinct tuple tags. Separate backend and
+%% socket arguments (or fields of the same record) lose that correlation.
+-type gen_sctp_socket() :: {gen_sctp, gen_sctp:sctp_socket()}.
+-type socket_api_socket() :: {socket, socket:socket()}.
+-type backend_socket() :: gen_sctp_socket() | socket_api_socket().
+-type key() :: {unique, reference()} | {sctp, backend(), [inet:ip_address()], inet:port_number()}.
+-type config(Backend) :: #{
+    key := key(),
+    backend := Backend,
+    local_addrs := nonempty_list(inet:ip_address()),
+    local_port := inet:port_number(),
+    socket_options := [esock:socket_option()],
+    pending_timeout := pos_integer() | infinity,
+    max_pending := pos_integer() | infinity,
+    start_listening := boolean(),
+    reject_unmatched := boolean()
+}.
+-type config() :: config(backend()).
+-type gen_sctp_state() :: #state{
+    socket :: gen_sctp_socket(),
+    config :: config(gen_sctp),
+    pending :: #{reference() => #pending{socket :: gen_sctp_socket()}},
+    connects :: [#connect{async :: undefined}]
+}.
+-type socket_state() :: #state{
+    socket :: socket_api_socket(),
+    config :: config(socket),
+    pending :: #{reference() => #pending{socket :: socket_api_socket(), assoc_id :: integer()}}
+}.
+-type state() :: gen_sctp_state() | socket_state().
+-type result() :: ok | {error, term()}.
+
+-spec start_link(config()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Config) ->
     gen_server:start_link(?MODULE, Config, []).
 
+-spec normalize_config(esock:socket_options()) -> {ok, key(), config()} | {error, term()}.
 normalize_config(Options) when is_map(Options) ->
     LocalAddrs0 = maps:get(local_addrs, Options, [loopback]),
     LocalPort = maps:get(local_port, Options, 0),
@@ -100,10 +134,18 @@ normalize_config(Options) when is_map(Options) ->
     Backend = maps:get(backend, Options, gen_sctp),
     StartListening = maps:get(start_listening, Options, true),
     RejectUnmatched = maps:get(reject_unmatched, Options, false),
-    case normalize_local_config(
-        LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
-        StartListening, RejectUnmatched
-    ) of
+    case
+        normalize_local_config(
+            LocalAddrs0,
+            LocalPort,
+            SocketOptions,
+            PendingTimeout,
+            MaxPending,
+            Backend,
+            StartListening,
+            RejectUnmatched
+        )
+    of
         {ok, LocalAddrs} ->
             case backend_supported(Backend) of
                 true ->
@@ -133,6 +175,7 @@ normalize_config(Options) when is_map(Options) ->
 normalize_config(Options) ->
     {error, {invalid_socket_options, Options}}.
 
+-spec backend_supported(backend()) -> boolean().
 backend_supported(gen_sctp) -> true;
 backend_supported(socket) -> esock_socket_api:supported().
 
@@ -163,6 +206,7 @@ cancel_connect(Pid, Lease, ConnectRef) ->
 accept(Pid, Lease, PendingRef, Owner, Options) ->
     call(Pid, {accept, Lease, PendingRef, Owner, Options}).
 
+-spec init(config()) -> {ok, state()} | {stop, term()}.
 init(Config) ->
     process_flag(trap_exit, true),
     case open(Config) of
@@ -173,28 +217,30 @@ init(Config) ->
                 local_addrs = LocalAddrs,
                 local_port = LocalPort,
                 pending_order = queue:new(),
-                listening = maps:get(start_listening, Config),
-                backend = maps:get(backend, Config)
+                listening = maps:get(start_listening, Config)
             },
             {ok, rearm(State)};
         {error, Reason} ->
             {stop, Reason}
     end.
 
+-spec handle_call(term(), gen_server:from(), state()) -> {reply, term(), state()}.
 handle_call({acquire, Owner, Config}, _From, State0) ->
     case compatible(Config, State0#state.config) of
         true ->
             Lease = make_ref(),
             Monitor = erlang:monitor(process, Owner),
             Leases = (State0#state.leases)#{Lease => {Owner, Monitor}},
-            ListeningLeases = case maps:get(start_listening, Config) of
-                true -> (State0#state.listening_leases)#{Lease => true};
-                false -> State0#state.listening_leases
-            end,
+            ListeningLeases =
+                case maps:get(start_listening, Config) of
+                    true -> (State0#state.listening_leases)#{Lease => true};
+                    false -> State0#state.listening_leases
+                end,
             Candidate = State0#state{leases = Leases, listening_leases = ListeningLeases},
             case sync_listening(Candidate) of
                 {ok, State} ->
-                    {reply, {ok, #esock_socket_ref{pid = self(), lease = Lease}}, cancel_stop(State)};
+                    {reply, {ok, #esock_socket_ref{pid = self(), lease = Lease}},
+                        cancel_stop(State)};
                 {error, Reason} ->
                     erlang:demonitor(Monitor, [flush]),
                     {reply, {error, {listen, Reason}}, State0}
@@ -210,10 +256,11 @@ handle_call({listen, Lease, Enabled}, _From, State0) ->
         false ->
             {reply, {error, invalid_lease}, State0};
         true ->
-            ListeningLeases = case Enabled of
-                true -> (State0#state.listening_leases)#{Lease => true};
-                false -> maps:remove(Lease, State0#state.listening_leases)
-            end,
+            ListeningLeases =
+                case Enabled of
+                    true -> (State0#state.listening_leases)#{Lease => true};
+                    false -> maps:remove(Lease, State0#state.listening_leases)
+                end,
             case sync_listening(State0#state{listening_leases = ListeningLeases}) of
                 {ok, State} -> {reply, ok, State};
                 {error, Reason} -> {reply, {error, {listen, Reason}}, State0}
@@ -253,7 +300,7 @@ handle_call({cancel_connect, Lease, ConnectRef}, _From, State0) ->
             {reply, ok, maybe_start_queued(State0#state{connects = Connects})};
         {value, #connect{lease = Lease} = Connect, Connects} ->
             Canceled = cancel_connect_record(
-                State0#state.backend, State0#state.socket, Connect
+                State0#state.socket, Connect
             ),
             State = maybe_start_queued(State0#state{connects = [Canceled | Connects]}),
             {reply, ok, State};
@@ -267,9 +314,11 @@ handle_call({accept, Lease, PendingRef, Owner, Options}, {Caller, _Tag}, State0)
 handle_call(_Request, _From, State) ->
     {reply, {error, bad_request}, State}.
 
+-spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Message, State) ->
     {noreply, State}.
 
+-spec handle_socket_message(term(), socket_state()) -> socket_state().
 handle_socket_message(Message, State0) ->
     case take_connect_by_async(Message, State0#state.connects) of
         {value, Connect, Connects} ->
@@ -278,8 +327,8 @@ handle_socket_message(Message, State0) ->
             handle_listener_message(Message, State0)
     end.
 
-handle_connect_message(Message, Connect, Connects, State0) ->
-    Result = connect_message_result(State0#state.socket, Message),
+handle_connect_message(Message, Connect, Connects, #state{socket = {socket, Socket}} = State0) ->
+    Result = connect_message_result(Socket, Message),
     case Result of
         {ok, AssocId} ->
             Updated = Connect#connect{assoc_id = AssocId, async = undefined},
@@ -304,6 +353,8 @@ handle_connect_message(Message, Connect, Connects, State0) ->
             end
     end.
 
+-spec connect_message_result(socket:socket(), term()) ->
+    {ok, integer() | undefined} | {error, term()}.
 connect_message_result(Socket, {'$socket', Socket, select, _Handle}) ->
     esock_socket_api:finish_connect(Socket);
 connect_message_result(_Socket, {'$socket', _SocketRef, completion, {_Handle, ok}}) ->
@@ -315,8 +366,9 @@ connect_message_result(_Socket, {'$socket', _SocketRef, completion, {_Handle, {e
 connect_message_result(_Socket, {'$socket', _SocketRef, abort, {_Handle, Reason}}) ->
     {error, Reason}.
 
-handle_listener_message(Message, State0) ->
-    case esock_socket_api:listener_message(State0#state.socket, Message) of
+-spec handle_listener_message(term(), socket_state()) -> socket_state().
+handle_listener_message(Message, #state{socket = {socket, Socket}} = State0) ->
+    case esock_socket_api:listener_message(Socket, Message) of
         {ok, {event, RemoteAddr, RemotePort, Event}} ->
             rearm(handle_sctp(RemoteAddr, RemotePort, {[], Event}, State0));
         {ok, {data, RemoteAddr, RemotePort, Info, Data}} ->
@@ -342,34 +394,40 @@ take_connect_by_async(Message, Connects) ->
             )
     end.
 
+-spec socket_message_handle(term()) -> reference() | undefined.
 socket_message_handle({'$socket', _Socket, select, Handle}) -> Handle;
 socket_message_handle({'$socket', _Socket, completion, {Handle, _Result}}) -> Handle;
 socket_message_handle({'$socket', _Socket, abort, {Handle, _Reason}}) -> Handle;
 socket_message_handle(_Message) -> undefined.
 
+-spec async_handle(esock_socket_api:async_info() | undefined) -> reference() | undefined.
 async_handle({select_info, _Operation, Handle}) -> Handle;
 async_handle({completion_info, _Operation, Handle}) -> Handle;
 async_handle(_) -> undefined.
 
 cancel_async(#connect{async = undefined}, State) ->
     State;
-cancel_async(#connect{async = Async}, #state{backend = socket, socket = Socket} = State) ->
+cancel_async(#connect{async = Async}, #state{socket = {socket, Socket}} = State) ->
     _ = esock_socket_api:cancel(Socket, Async),
     State.
 
-handle_info({sctp, Socket, RemoteAddr, RemotePort, Data}, #state{socket = Socket} = State0) ->
+-spec handle_info(term(), state()) -> {noreply, state()} | {stop, term(), state()}.
+handle_info(
+    {sctp, Socket, RemoteAddr, RemotePort, Data},
+    #state{socket = {_Backend, Socket}} = State0
+) ->
     State = handle_sctp(RemoteAddr, RemotePort, Data, State0),
     {noreply, rearm(State)};
 handle_info(
     {'$socket', Socket, _Tag, _Info} = Message,
-    #state{backend = socket, socket = Socket} = State0
+    #state{socket = {socket, Socket}} = State0
 ) ->
     {noreply, handle_socket_message(Message, State0)};
 handle_info({pending_timeout, PendingRef}, State0) ->
     {noreply, drop_pending(PendingRef, State0)};
 handle_info(
     {'EXIT', Socket, Reason},
-    #state{backend = gen_sctp, socket = Socket} = State
+    #state{socket = {gen_sctp, Socket}} = State
 ) ->
     {stop, {shutdown, {socket_closed, Reason}}, State};
 handle_info(
@@ -386,14 +444,15 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State0) ->
 handle_info(_Message, State) ->
     {noreply, State}.
 
+-spec terminate(term(), state()) -> ok.
 terminate(_Reason, State) ->
     maps:foreach(
         fun(_Ref, #pending{socket = Socket}) ->
-            close_socket(State#state.backend, Socket)
+            close_socket(Socket)
         end,
         State#state.pending
     ),
-    close_socket(State#state.backend, State#state.socket),
+    close_socket(State#state.socket),
     try esock_registry:socket_down(self()) of
         ok -> ok
     catch
@@ -411,8 +470,14 @@ call(Pid, Request) ->
     end.
 
 normalize_local_config(
-    LocalAddrs0, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
-    StartListening, RejectUnmatched
+    LocalAddrs0,
+    LocalPort,
+    SocketOptions,
+    PendingTimeout,
+    MaxPending,
+    Backend,
+    StartListening,
+    RejectUnmatched
 ) when
     is_list(LocalAddrs0),
     LocalAddrs0 =/= [],
@@ -436,8 +501,14 @@ normalize_local_config(
             Error
     end;
 normalize_local_config(
-    LocalAddrs, LocalPort, SocketOptions, PendingTimeout, MaxPending, Backend,
-    StartListening, RejectUnmatched
+    LocalAddrs,
+    LocalPort,
+    SocketOptions,
+    PendingTimeout,
+    MaxPending,
+    Backend,
+    StartListening,
+    RejectUnmatched
 ) ->
     {error,
         {invalid_socket_options, #{
@@ -523,17 +594,26 @@ valid_socket_options(Options) ->
 
 compatible(New, Existing) ->
     Keys = [
-        backend, local_addrs, local_port, socket_options, pending_timeout, max_pending,
+        backend,
+        local_addrs,
+        local_port,
+        socket_options,
+        pending_timeout,
+        max_pending,
         reject_unmatched
     ],
     maps:with(Keys, New) =:= maps:with(Keys, Existing).
 
+-spec open(config()) ->
+    {ok, backend_socket(), [inet:ip_address()], inet:port_number()} | {error, term()}.
 open(Config) ->
     case maps:get(backend, Config) of
         gen_sctp -> open_gen_sctp(Config);
         socket -> open_socket_api(Config)
     end.
 
+-spec open_gen_sctp(config(gen_sctp)) ->
+    {ok, gen_sctp_socket(), [inet:ip_address()], inet:port_number()} | {error, term()}.
 open_gen_sctp(Config) ->
     LocalAddrs = maps:get(local_addrs, Config),
     LocalPort = maps:get(local_port, Config),
@@ -542,15 +622,16 @@ open_gen_sctp(Config) ->
     Options = [binary, {active, once}, {port, LocalPort} | AddressOptions ++ UserOptions],
     case gen_sctp:open(Options) of
         {ok, Socket} ->
-            ListenResult = case maps:get(start_listening, Config) of
-                true -> gen_sctp:listen(Socket, true);
-                false -> ok
-            end,
+            ListenResult =
+                case maps:get(start_listening, Config) of
+                    true -> gen_sctp:listen(Socket, true);
+                    false -> ok
+                end,
             case ListenResult of
                 ok ->
                     case socket_names(Socket, LocalAddrs, LocalPort) of
                         {ok, ActualAddrs, ActualPort} ->
-                            {ok, Socket, ActualAddrs, ActualPort};
+                            {ok, {gen_sctp, Socket}, ActualAddrs, ActualPort};
                         {error, Reason} ->
                             gen_sctp:close(Socket),
                             {error, Reason}
@@ -563,14 +644,25 @@ open_gen_sctp(Config) ->
             {error, {open, Reason}}
     end.
 
+-spec open_socket_api(config(socket)) ->
+    {ok, socket_api_socket(), [inet:ip_address()], inet:port_number()} | {error, term()}.
 open_socket_api(Config) ->
-    esock_socket_api:open(
-        maps:get(local_addrs, Config),
-        maps:get(local_port, Config),
-        maps:get(socket_options, Config),
-        maps:get(start_listening, Config)
-    ).
+    case
+        esock_socket_api:open(
+            maps:get(local_addrs, Config),
+            maps:get(local_port, Config),
+            maps:get(socket_options, Config),
+            maps:get(start_listening, Config)
+        )
+    of
+        {ok, Socket, LocalAddrs, LocalPort} ->
+            {ok, {socket, Socket}, LocalAddrs, LocalPort};
+        {error, _} = Error ->
+            Error
+    end.
 
+-spec socket_names(gen_sctp:sctp_socket(), [inet:ip_address()], inet:port_number()) ->
+    {ok, [inet:ip_address()], inet:port_number()} | {error, term()}.
 socket_names(Socket, ConfiguredAddrs, ConfiguredPort) ->
     esock_names:socket(inet:socknames(Socket), ConfiguredAddrs, ConfiguredPort).
 
@@ -707,7 +799,9 @@ dispatch(Route, Pending0, State0) ->
     PendingMap = (State0#state.pending)#{Pending#pending.ref => Pending},
     State0#state{pending = PendingMap}.
 
-start_connect(Lease, Options, Caller, State0) when is_map(Options) ->
+start_connect(Lease, Options, Caller, #state{socket = {Backend, _Socket}} = State0) when
+    is_map(Options)
+->
     Owner = maps:get(owner, Options, Caller),
     RemoteAddrs0 = maps:get(remote_addrs, Options, undefined),
     RemotePort = maps:get(remote_port, Options, undefined),
@@ -729,7 +823,7 @@ start_connect(Lease, Options, Caller, State0) when is_map(Options) ->
                         remote_port = RemotePort,
                         options = ConnectOptions
                     },
-                    case connect_can_start(Connect0, State0#state.connects, State0#state.backend) of
+                    case connect_can_start(Connect0, State0#state.connects, Backend) of
                         false ->
                             {reply, {ok, Ref}, State0#state{
                                 connects = [Connect0 | State0#state.connects]
@@ -847,7 +941,7 @@ ambiguous_canceled_connect(Connect, Connects) ->
         Connects
     ).
 
-maybe_start_queued(#state{backend = Backend, connects = Connects} = State0) ->
+maybe_start_queued(#state{socket = {Backend, _Socket}, connects = Connects} = State0) ->
     case socket_connect_pending(Connects) of
         true ->
             State0;
@@ -890,32 +984,39 @@ accept_pending(Lease, Caller, PendingRef, Owner, Options, State0) ->
             Socket = Pending#pending.socket,
             case
                 prepare_handoff(
-                    State0#state.backend, Socket, Pending#pending.assoc_id, Owner, Options
+                    Socket, Pending#pending.assoc_id, Owner, Options
                 )
             of
                 ok ->
                     Assoc = make_assoc(
-                        State0#state.backend,
-                        Pending#pending.assoc_id,
                         Socket,
+                        Pending#pending.assoc_id,
                         Pending#pending.info
                     ),
                     {reply, {ok, Assoc}, State0#state{pending = PendingMap}};
                 {error, Reason} ->
-                    close_socket(State0#state.backend, Socket),
+                    close_socket(Socket),
                     {reply, {error, {handoff, Reason}}, State0#state{pending = PendingMap}}
             end;
         error ->
             {reply, {error, not_found}, State0}
     end.
 
-prepare_handoff(gen_sctp, Socket, _AssocId, Owner, Options) ->
+-spec prepare_handoff
+    (
+        gen_sctp_socket(),
+        gen_sctp:assoc_id(),
+        pid(),
+        [esock:socket_option()]
+    ) -> result();
+    (socket_api_socket(), integer(), pid(), [esock:socket_option()]) -> result().
+prepare_handoff({gen_sctp, Socket}, _AssocId, Owner, Options) ->
     PassiveOptions = proplists:delete(active, Options) ++ [{active, false}],
     case inet:setopts(Socket, PassiveOptions) of
         ok -> gen_sctp:controlling_process(Socket, Owner);
         {error, _} = Error -> Error
     end;
-prepare_handoff(socket, Socket, _AssocId, Owner, Options) ->
+prepare_handoff({socket, Socket}, _AssocId, Owner, Options) ->
     PassiveOptions = proplists:delete(active, Options),
     case esock_socket_api:setopts(Socket, PassiveOptions) of
         ok -> esock_socket_api:controlling_process(Socket, Owner);
@@ -941,19 +1042,19 @@ handle_sctp(_RemoteAddr, _RemotePort, _Data, State) ->
 
 association_up(RemoteAddr, RemotePort, Change, State0) ->
     AssocId = Change#sctp_assoc_change.assoc_id,
-    case peeloff(State0#state.backend, State0#state.socket, AssocId) of
+    case peeloff(State0#state.socket, AssocId) of
         {ok, AssocSocket} ->
-            case prepare_peeled(State0#state.backend, AssocSocket) of
+            case prepare_peeled(AssocSocket) of
                 ok ->
                     route_association(AssocSocket, RemoteAddr, RemotePort, Change, State0);
                 {error, Reason} ->
-                    close_socket(State0#state.backend, AssocSocket),
+                    close_socket(AssocSocket),
                     association_setup_failed(
                         RemoteAddr, RemotePort, Change, {setopts, Reason}, State0
                     )
             end;
         {error, Reason} ->
-            _ = abort(State0#state.backend, State0#state.socket, AssocId),
+            _ = abort(State0#state.socket, AssocId),
             association_setup_failed(
                 RemoteAddr, RemotePort, Change, {peeloff, Reason}, State0
             )
@@ -982,7 +1083,7 @@ route_association(AssocSocket, RemoteAddr, RemotePort, Change, State0) ->
     AssocId = Change#sctp_assoc_change.assoc_id,
     case take_connect_for_event(AssocId, RemoteAddr, RemotePort, State0#state.connects) of
         {value, #connect{canceled = true} = Connect, Connects} ->
-            close_socket(State0#state.backend, AssocSocket),
+            close_socket(AssocSocket),
             maybe_start_queued(cancel_async(Connect, State0#state{connects = Connects}));
         {value, Connect, Connects} ->
             maybe_start_queued(
@@ -997,18 +1098,17 @@ route_association(AssocSocket, RemoteAddr, RemotePort, Change, State0) ->
 complete_connect(AssocSocket, Change, Info, Connect, State0) ->
     maybe_demonitor(Connect#connect.monitor),
     State1 = cancel_async(Connect, State0),
-    case controlling_process(State1#state.backend, AssocSocket, Connect#connect.owner) of
+    case controlling_process(AssocSocket, Connect#connect.owner) of
         ok ->
             Assoc = make_assoc(
-                State1#state.backend,
-                Change#sctp_assoc_change.assoc_id,
                 AssocSocket,
+                Change#sctp_assoc_change.assoc_id,
                 Info
             ),
             Connect#connect.owner ! {esock, Connect#connect.ref, {connected, Assoc, Info}},
             State1;
         {error, Reason} ->
-            close_socket(State1#state.backend, AssocSocket),
+            close_socket(AssocSocket),
             Connect#connect.owner ! {esock, Connect#connect.ref, {error, {handoff, Reason}}},
             State1
     end.
@@ -1038,14 +1138,16 @@ queue_incoming(AssocSocket, Change, Info, State0) ->
                 "Dropping ambiguous SCTP association from ~p:~p",
                 [maps:get(remote_addrs, Info), maps:get(remote_port, Info)]
             ),
-            close_socket(State0#state.backend, AssocSocket),
+            close_socket(AssocSocket),
             State0;
         false ->
-            case maps:get(reject_unmatched, State0#state.config) orelse
-                pending_limit_reached(State0) of
+            case
+                maps:get(reject_unmatched, State0#state.config) orelse
+                    pending_limit_reached(State0)
+            of
                 true ->
                     cancel_timer(Timer),
-                    close_socket(State0#state.backend, AssocSocket),
+                    close_socket(AssocSocket),
                     State0;
                 false ->
                     PendingMap = (State0#state.pending)#{PendingRef => Pending},
@@ -1088,10 +1190,9 @@ association_failed(RemoteAddr, RemotePort, Change, State0) ->
 peer_info(Socket, RemoteAddr, RemotePort, Change, State) ->
     AssocId = Change#sctp_assoc_change.assoc_id,
     {RemoteAddrs, ActualRemotePort} = names(
-        State#state.backend, Socket, peernames, AssocId, [RemoteAddr], RemotePort
+        Socket, peernames, AssocId, [RemoteAddr], RemotePort
     ),
     {LocalAddrs, ActualLocalPort} = names(
-        State#state.backend,
         Socket,
         socknames,
         AssocId,
@@ -1107,9 +1208,26 @@ peer_info(Socket, RemoteAddr, RemotePort, Change, State) ->
         outbound_streams => Change#sctp_assoc_change.outbound_streams
     }.
 
-names(gen_sctp, Socket, Function, _AssocId, DefaultAddrs, DefaultPort) ->
+-spec names
+    (
+        gen_sctp_socket(),
+        socknames | peernames,
+        gen_sctp:assoc_id(),
+        [inet:ip_address()],
+        inet:port_number()
+    ) ->
+        {[inet:ip_address()], inet:port_number()};
+    (
+        socket_api_socket(),
+        socknames | peernames,
+        integer(),
+        [inet:ip_address()],
+        inet:port_number()
+    ) ->
+        {[inet:ip_address()], inet:port_number()}.
+names({gen_sctp, Socket}, Function, _AssocId, DefaultAddrs, DefaultPort) ->
     esock_names:association(inet:Function(Socket), DefaultAddrs, DefaultPort);
-names(socket, Socket, Function, AssocId, DefaultAddrs, DefaultPort) ->
+names({socket, Socket}, Function, AssocId, DefaultAddrs, DefaultPort) ->
     Result =
         case Function of
             socknames -> esock_socket_api:socknames(Socket, AssocId);
@@ -1117,7 +1235,12 @@ names(socket, Socket, Function, AssocId, DefaultAddrs, DefaultPort) ->
         end,
     esock_names:association(Result, DefaultAddrs, DefaultPort).
 
-make_assoc(Backend, AssocId, Socket, Info) ->
+-spec make_assoc
+    (gen_sctp_socket(), gen_sctp:assoc_id(), esock:peer_info()) ->
+        #esock_assoc_ref{backend :: gen_sctp, socket :: gen_sctp:sctp_socket()};
+    (socket_api_socket(), integer(), esock:peer_info()) ->
+        #esock_assoc_ref{backend :: socket, socket :: socket:socket(), assoc_id :: integer()}.
+make_assoc({Backend, Socket}, AssocId, Info) ->
     #esock_assoc_ref{
         backend = Backend,
         socket = Socket,
@@ -1189,7 +1312,7 @@ drop_pending(PendingRef, State0) ->
     case maps:take(PendingRef, State0#state.pending) of
         {Pending, PendingMap} ->
             maybe_demonitor(Pending#pending.monitor),
-            close_socket(State0#state.backend, Pending#pending.socket),
+            close_socket(Pending#pending.socket),
             remove_pending_order(PendingRef, State0#state{pending = PendingMap});
         error ->
             State0
@@ -1247,7 +1370,8 @@ remove_lease(Lease, State0) ->
             },
             State2 = maybe_start_queued(lists:foldl(fun drop_pending/2, State1, PendingRefs)),
             case sync_listening(State2) of
-                {ok, State3} -> State3;
+                {ok, State3} ->
+                    State3;
                 {error, Reason} ->
                     logger:warning("Could not update SCTP listen state: ~p", [Reason]),
                     State2
@@ -1268,7 +1392,7 @@ cancel_matching_connects(Predicate, State) ->
                 true ->
                     [
                         cancel_connect_record(
-                            State#state.backend, State#state.socket, Connect
+                            State#state.socket, Connect
                         )
                         | Acc
                     ]
@@ -1297,24 +1421,29 @@ cancel_stop(#state{stop_timer = {_StopRef, TimerRef}} = State) ->
 sync_listening(#state{listening = Listening, listening_leases = Leases} = State) ->
     Enabled = map_size(Leases) > 0,
     case Enabled =:= Listening of
-        true -> {ok, State};
+        true ->
+            {ok, State};
         false ->
-            case set_listening(State#state.backend, State#state.socket, Enabled) of
+            case set_listening(State#state.socket, Enabled) of
                 ok -> {ok, State#state{listening = Enabled}};
                 {error, _} = Error -> Error
             end
     end.
 
-set_listening(gen_sctp, Socket, Enabled) -> gen_sctp:listen(Socket, Enabled);
-set_listening(socket, Socket, Enabled) -> socket:listen(Socket, Enabled).
+-spec set_listening(backend_socket(), boolean()) -> result().
+set_listening({gen_sctp, Socket}, Enabled) -> gen_sctp:listen(Socket, Enabled);
+set_listening({socket, Socket}, Enabled) -> socket:listen(Socket, Enabled).
 
-rearm(#state{backend = gen_sctp, socket = Socket} = State) ->
+-spec rearm
+    (gen_sctp_state()) -> gen_sctp_state();
+    (socket_state()) -> socket_state().
+rearm(#state{socket = {gen_sctp, Socket}} = State) ->
     case inet:setopts(Socket, [{active, once}]) of
         ok -> State;
         {error, closed} -> exit({shutdown, {socket_closed, closed}});
         {error, Reason} -> exit({setopts, Reason})
     end;
-rearm(#state{backend = socket, socket = Socket} = State) ->
+rearm(#state{socket = {socket, Socket}} = State) ->
     ok = esock_socket_api:arm_listener(Socket),
     State.
 
@@ -1335,17 +1464,17 @@ cancel_timer(Timer) ->
     erlang:cancel_timer(Timer),
     ok.
 
-cancel_connect_record(_Backend, _Socket, #connect{canceled = true} = Connect) ->
+-spec cancel_connect_record(backend_socket(), #connect{}) -> #connect{}.
+cancel_connect_record(_Socket, #connect{canceled = true} = Connect) ->
     Connect;
 cancel_connect_record(
-    gen_sctp, Socket, #connect{monitor = Monitor, assoc_id = AssocId} = Connect
+    {gen_sctp, Socket}, #connect{monitor = Monitor, assoc_id = AssocId} = Connect
 ) ->
     maybe_demonitor(Monitor),
-    _ = abort(gen_sctp, Socket, AssocId),
+    _ = abort({gen_sctp, Socket}, AssocId),
     Connect#connect{monitor = undefined, canceled = true};
 cancel_connect_record(
-    socket,
-    Socket,
+    {socket, Socket},
     #connect{monitor = Monitor, assoc_id = AssocId} = Connect
 ) ->
     maybe_demonitor(Monitor),
@@ -1355,7 +1484,16 @@ cancel_connect_record(
     _ = esock_socket_api:abort(Socket, AssocId),
     Connect#connect{monitor = undefined, canceled = true}.
 
-connect_init(#state{backend = gen_sctp, socket = Socket}, Address, Port, Options) ->
+-spec connect_init
+    (
+        gen_sctp_state(),
+        inet:ip_address(),
+        inet:port_number(),
+        [esock:socket_option()]
+    ) -> {ok, gen_sctp:assoc_id()} | {error, term()};
+    (socket_state(), inet:ip_address(), inet:port_number(), [esock:socket_option()]) ->
+        esock_socket_api:connect_result().
+connect_init(#state{socket = {gen_sctp, Socket}}, Address, Port, Options) ->
     case gen_sctp:connectx_init(Socket, [Address], Port, Options) of
         {error, enotsup} ->
             case gen_sctp:connect_init(Socket, Address, Port, Options) of
@@ -1365,66 +1503,92 @@ connect_init(#state{backend = gen_sctp, socket = Socket}, Address, Port, Options
         Result ->
             Result
     end;
-connect_init(#state{backend = socket, socket = Socket}, Address, Port, Options) ->
+connect_init(#state{socket = {socket, Socket}}, Address, Port, Options) ->
     esock_socket_api:connect(Socket, Address, Port, Options).
 
-peeloff(gen_sctp, Socket, AssocId) ->
-    gen_sctp:peeloff(Socket, AssocId);
-peeloff(socket, Socket, AssocId) ->
-    esock_socket_api:peeloff(Socket, AssocId).
+-spec peeloff
+    (gen_sctp_socket(), gen_sctp:assoc_id()) ->
+        {ok, gen_sctp_socket()} | {error, term()};
+    (socket_api_socket(), integer()) -> {ok, socket_api_socket()} | {error, term()}.
+peeloff({gen_sctp, Socket}, AssocId) ->
+    case gen_sctp:peeloff(Socket, AssocId) of
+        {ok, AssocSocket} -> {ok, {gen_sctp, AssocSocket}};
+        {error, _} = Error -> Error
+    end;
+peeloff({socket, Socket}, AssocId) ->
+    case esock_socket_api:peeloff(Socket, AssocId) of
+        {ok, AssocSocket} -> {ok, {socket, AssocSocket}};
+        {error, _} = Error -> Error
+    end.
 
-prepare_peeled(gen_sctp, Socket) ->
+-spec prepare_peeled(backend_socket()) -> result().
+prepare_peeled({gen_sctp, Socket}) ->
     inet:setopts(Socket, [{active, false}]);
-prepare_peeled(socket, _Socket) ->
+prepare_peeled({socket, _Socket}) ->
     ok.
 
-controlling_process(gen_sctp, Socket, Owner) ->
+-spec controlling_process(backend_socket(), pid()) -> result().
+controlling_process({gen_sctp, Socket}, Owner) ->
     gen_sctp:controlling_process(Socket, Owner);
-controlling_process(socket, Socket, Owner) ->
+controlling_process({socket, Socket}, Owner) ->
     esock_socket_api:controlling_process(Socket, Owner).
 
-abort(gen_sctp, _Socket, undefined) ->
+-spec abort
+    (gen_sctp_socket(), gen_sctp:assoc_id()) -> result();
+    (socket_api_socket(), integer() | undefined) -> result().
+abort({gen_sctp, _Socket}, undefined) ->
     ok;
-abort(gen_sctp, Socket, AssocId) ->
+abort({gen_sctp, Socket}, AssocId) ->
     gen_sctp:abort(Socket, #sctp_assoc_change{assoc_id = AssocId});
-abort(socket, Socket, AssocId) ->
+abort({socket, Socket}, AssocId) ->
     esock_socket_api:abort(Socket, AssocId).
 
-close_socket(gen_sctp, Socket) ->
+-spec close_socket(backend_socket()) -> result().
+close_socket({gen_sctp, Socket}) ->
     gen_sctp:close(Socket);
-close_socket(socket, Socket) ->
+close_socket({socket, Socket}) ->
     esock_socket_api:close(Socket).
 
 -ifdef(TEST).
 counter_wrap_is_not_an_async_connect_message_test() ->
-    Message = {'$socket', listener, counter_wrap, recv_oct},
-    State = #state{
-        backend = socket,
-        socket = listener,
-        pending_order = queue:new(),
-        connects = [#connect{async = undefined}]
-    },
-    ?assertEqual(State, handle_socket_message(Message, State)).
+    with_test_socket(fun(Socket) ->
+        Message = {'$socket', Socket, counter_wrap, recv_oct},
+        State = (test_state(Socket))#state{connects = [test_connect()]},
+        ?assertEqual(State, handle_socket_message(Message, State))
+    end).
 
 pending_assignment_is_fifo_test() ->
+    with_test_socket(fun pending_assignment_is_fifo/1).
+
+pending_assignment_is_fifo(Socket) ->
     FirstRef = make_ref(),
     SecondRef = make_ref(),
     RouteRef = make_ref(),
     Lease = make_ref(),
-    Info1 = #{remote_addrs => [{127, 0, 0, 1}], remote_port => 1111},
-    Info2 = #{remote_addrs => [{127, 0, 0, 1}], remote_port => 2222},
+    Info = #{
+        local_addrs => [{127, 0, 0, 1}],
+        local_port => 0,
+        remote_addrs => [{127, 0, 0, 1}],
+        inbound_streams => 0,
+        outbound_streams => 0
+    },
+    Info1 = Info#{remote_port => 1111},
+    Info2 = Info#{remote_port => 2222},
     Pending = #{
-        FirstRef => #pending{ref = FirstRef, info = Info1},
-        SecondRef => #pending{ref = SecondRef, info = Info2}
+        FirstRef => #pending{ref = FirstRef, socket = {socket, Socket}, assoc_id = 0, info = Info1},
+        SecondRef => #pending{
+            ref = SecondRef, socket = {socket, Socket}, assoc_id = 0, info = Info2
+        }
     },
     Route = #route{
         ref = RouteRef,
         lease = Lease,
         acceptor = self(),
+        monitor = make_ref(),
         remote_addrs = any,
         remote_port = any
     },
-    State = assign_pending(Route, #state{
+    State = assign_pending(Route, (test_state(Socket))#state{
         pending = Pending,
         pending_order = queue:from_list([FirstRef, SecondRef])
     }),
@@ -1442,10 +1606,40 @@ pending_assignment_is_fifo_test() ->
 conflicting_connect_ignores_canceled_test() ->
     RemoteAddrs = [{127, 0, 0, 1}],
     RemotePort = 3868,
-    Canceled = #connect{
+    Canceled = (test_connect())#connect{
         remote_addrs = RemoteAddrs,
         remote_port = RemotePort,
         canceled = true
     },
     ?assertEqual(false, conflicting_connect(RemoteAddrs, RemotePort, [Canceled])).
+
+%% Use real sockets and complete records so fixtures obey production types.
+with_test_socket(Fun) ->
+    {ok, Socket} = socket:open(inet, dgram, udp),
+    try
+        Fun(Socket)
+    after
+        ok = socket:close(Socket)
+    end.
+
+test_state(Socket) ->
+    {ok, _Key, Config} = normalize_config(#{}),
+    #state{
+        socket = {socket, Socket},
+        config = Config#{backend => socket},
+        local_addrs = maps:get(local_addrs, Config),
+        local_port = 0,
+        pending_order = queue:new()
+    }.
+
+test_connect() ->
+    #connect{
+        ref = make_ref(),
+        lease = make_ref(),
+        owner = self(),
+        remote_addrs = [{127, 0, 0, 1}],
+        remaining = [{127, 0, 0, 1}],
+        current = {127, 0, 0, 1},
+        remote_port = 3868
+    }.
 -endif.

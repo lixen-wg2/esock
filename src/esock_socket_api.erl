@@ -23,15 +23,58 @@
     decode_sctp/3
 ]).
 
+-export_type([async_info/0, connect_result/0]).
+
+%% socket:sctp_assoc_id/0 is only exported in OTP 29. Keep older OTPs
+%% compilable while supported/0 gates the SCTP socket capabilities at runtime.
+-type assoc_id() :: integer().
+-type async_info() :: socket:select_info() | socket:completion_info().
+-type result() :: ok | {error, term()}.
+-type open_result() ::
+    {ok, socket:socket(), [inet:ip_address()], inet:port_number()} | {error, term()}.
+-type connect_result() ::
+    {ok, assoc_id(), undefined}
+    | {ok, undefined, async_info() | undefined}
+    | {error, term()}.
+-type names_result() ::
+    {ok, [{inet:ip_address(), inet:port_number()}]} | {error, term()}.
+-type recv_result() ::
+    {select, socket:select_info()}
+    | {completion, socket:completion_info()}
+    | {select_read, {socket:select_info(), socket:msg_recv()}}
+    | {ok, socket:msg_recv()}
+    | {error, term()}
+    | socket:msg_recv().
+-type listener_result() ::
+    {ok, {event, inet:ip_address() | undefined, inet:port_number(), term()}}
+    | {ok, {data, inet:ip_address() | undefined, inet:port_number(), #sctp_sndrcvinfo{}, binary()}}
+    | pending
+    | ignore
+    | {error, term()}.
+-type decode_result() :: {ok, esock:decoded_sctp_message()} | ignore.
+-type recv_state() :: #{
+    assoc_id := assoc_id(),
+    remaining := pos_integer() | infinity,
+    notify_passive := boolean(),
+    select_info := async_info() | undefined
+}.
+
 -define(RECV_STATE(Socket), {?MODULE, recv_state, Socket}).
 -define(RECV_CTRL_SIZE, 1024).
 
+-spec open(
+    nonempty_list(inet:ip_address()),
+    inet:port_number(),
+    [esock:socket_option()],
+    boolean()
+) -> open_result().
 open(LocalAddrs, LocalPort, Options, StartListening) ->
     case supported() of
         true -> open_socket(LocalAddrs, LocalPort, Options, StartListening);
         false -> {error, {unsupported_backend, socket}}
     end.
 
+-spec supported() -> boolean().
 supported() ->
     case code:ensure_loaded(socket) of
         {module, socket} ->
@@ -45,6 +88,12 @@ supported() ->
             false
     end.
 
+-spec open_socket(
+    nonempty_list(inet:ip_address()),
+    inet:port_number(),
+    [esock:socket_option()],
+    boolean()
+) -> open_result().
 open_socket(LocalAddrs, LocalPort, Options, StartListening) ->
     Domain = address_domain(hd(LocalAddrs)),
     case socket:open(Domain, seqpacket, sctp, #{use_registry => false}) of
@@ -60,6 +109,15 @@ open_socket(LocalAddrs, LocalPort, Options, StartListening) ->
             {error, {open, Reason}}
     end.
 
+-spec prepare_socket(
+    socket:socket(),
+    inet | inet6,
+    nonempty_list(inet:ip_address()),
+    inet:port_number(),
+    [esock:socket_option()],
+    boolean()
+) ->
+    {ok, [inet:ip_address()], inet:port_number()} | {error, term()}.
 prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options, StartListening) ->
     case set_events(Socket) of
         ok ->
@@ -67,10 +125,11 @@ prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options, StartListening) -
                 ok ->
                     case bind_addresses(Socket, Domain, LocalAddrs, LocalPort) of
                         ok ->
-                            ListenResult = case StartListening of
-                                true -> socket:listen(Socket, true);
-                                false -> ok
-                            end,
+                            ListenResult =
+                                case StartListening of
+                                    true -> socket:listen(Socket, true);
+                                    false -> ok
+                                end,
                             case ListenResult of
                                 ok -> socket_names(Socket, LocalAddrs, LocalPort);
                                 {error, Reason} -> {error, {listen, Reason}}
@@ -85,6 +144,7 @@ prepare_socket(Socket, Domain, LocalAddrs, LocalPort, Options, StartListening) -
             {error, {events, Reason}}
     end.
 
+-spec set_events(socket:socket()) -> result().
 set_events(Socket) ->
     socket:setopt(Socket, {sctp, events}, #{
         data_io => true,
@@ -96,6 +156,12 @@ set_events(Socket) ->
         partial_delivery => true
     }).
 
+-spec bind_addresses(
+    socket:socket(),
+    inet | inet6,
+    nonempty_list(inet:ip_address()),
+    inet:port_number()
+) -> result().
 bind_addresses(Socket, Domain, [First | Rest], Port) ->
     case socket:bind(Socket, sockaddr(Domain, First, Port)) of
         ok when Rest =:= [] ->
@@ -115,9 +181,12 @@ bind_addresses(Socket, Domain, [First | Rest], Port) ->
             Error
     end.
 
+-spec socket_names(socket:socket(), [inet:ip_address()], inet:port_number()) ->
+    {ok, [inet:ip_address()], inet:port_number()} | {error, term()}.
 socket_names(Socket, ConfiguredAddrs, ConfiguredPort) ->
     esock_names:socket(socknames(Socket, 0), ConfiguredAddrs, ConfiguredPort).
 
+-spec close(socket:socket()) -> result().
 close(Socket) ->
     erase(?RECV_STATE(Socket)),
     case socket:close(Socket) of
@@ -126,10 +195,12 @@ close(Socket) ->
         {error, _} = Error -> Error
     end.
 
+-spec arm_listener(socket:socket()) -> ok.
 arm_listener(Socket) ->
     self() ! {'$socket', Socket, select, nowait},
     ok.
 
+-spec listener_message(socket:socket(), term()) -> listener_result().
 listener_message(Socket, {'$socket', Socket, select, Handle}) ->
     listener_recv_result(
         Socket, socket:recvmsg(Socket, 0, ?RECV_CTRL_SIZE, [], Handle)
@@ -141,6 +212,7 @@ listener_message(Socket, {'$socket', Socket, abort, {_Handle, Reason}}) ->
 listener_message(_Socket, _Message) ->
     ignore.
 
+-spec listener_recv_result(socket:socket(), recv_result()) -> listener_result().
 listener_recv_result(_Socket, {select, _SelectInfo}) ->
     pending;
 listener_recv_result(_Socket, {completion, _CompletionInfo}) ->
@@ -155,6 +227,7 @@ listener_recv_result(_Socket, {error, Reason}) ->
 listener_recv_result(_Socket, Message) when is_map(Message) ->
     socket_message(Message, undefined).
 
+-spec peeloff(socket:socket(), assoc_id()) -> {ok, socket:socket()} | {error, term()}.
 peeloff(Socket, AssocId) ->
     case apply(socket, peeloff, [Socket, AssocId]) of
         {ok, AssocSocket} ->
@@ -167,9 +240,11 @@ peeloff(Socket, AssocId) ->
             Error
     end.
 
+-spec controlling_process(socket:socket(), pid()) -> result().
 controlling_process(Socket, Owner) ->
     socket:setopt(Socket, {otp, controlling_process}, Owner).
 
+-spec setopts(socket:socket(), [esock:socket_option()]) -> result().
 setopts(Socket, Options) ->
     lists:foldl(
         fun
@@ -180,6 +255,7 @@ setopts(Socket, Options) ->
         Options
     ).
 
+-spec association_setopts(socket:socket(), assoc_id(), [esock:socket_option()]) -> result().
 association_setopts(Socket, AssocId, Options) ->
     PassiveOptions = proplists:delete(active, Options),
     case setopts(Socket, PassiveOptions) of
@@ -192,6 +268,7 @@ association_setopts(Socket, AssocId, Options) ->
             Error
     end.
 
+-spec setopt(socket:socket(), esock:socket_option()) -> result().
 setopt(_Socket, {active, _Active}) ->
     ok;
 setopt(Socket, {reuseaddr, Value}) ->
@@ -237,6 +314,12 @@ update_option(Socket, Option, Updates) ->
             Error
     end.
 
+-spec connect(
+    socket:socket(),
+    inet:ip_address(),
+    inet:port_number(),
+    [esock:socket_option()]
+) -> connect_result().
 connect(Socket, Address, Port, Options) ->
     case setopts(Socket, Options) of
         ok ->
@@ -255,26 +338,34 @@ connect(Socket, Address, Port, Options) ->
             Error
     end.
 
+-spec finish_connect(socket:socket()) -> {ok, undefined} | {error, term()}.
 finish_connect(Socket) ->
     normalize_connect_result(socket:connect(Socket)).
 
+-spec normalize_connect_result(result()) -> {ok, undefined} | {error, term()}.
 normalize_connect_result(ok) -> {ok, undefined};
 normalize_connect_result({error, _} = Error) -> Error.
 
+-spec cancel(socket:socket(), async_info()) -> result().
 cancel(Socket, SelectInfo) ->
     socket:cancel(Socket, SelectInfo).
 
+-spec abort(socket:socket(), assoc_id() | undefined) -> result().
 abort(_Socket, undefined) ->
     ok;
 abort(Socket, AssocId) ->
     send(Socket, AssocId, 0, 0, 0, 0, [abort], <<>>).
 
+-spec socknames(socket:socket(), assoc_id()) -> names_result().
 socknames(Socket, AssocId) ->
     names(apply(socket, socknames, [Socket, AssocId])).
 
+-spec peernames(socket:socket(), assoc_id()) -> names_result().
 peernames(Socket, AssocId) ->
     names(apply(socket, peernames, [Socket, AssocId])).
 
+-spec names({ok, [socket:sockaddr_in() | socket:sockaddr_in6()]} | {error, term()}) ->
+    names_result().
 names({ok, SockAddrs}) ->
     {ok, [
         {Address, Port}
@@ -283,6 +374,7 @@ names({ok, SockAddrs}) ->
 names({error, _} = Error) ->
     Error.
 
+-spec activate(socket:socket(), assoc_id(), esock:active_mode() | -32768..0) -> result().
 activate(Socket, _AssocId, false) ->
     deactivate(Socket),
     ok;
@@ -295,6 +387,7 @@ activate(Socket, AssocId, Active) when is_integer(Active), Active > 0 ->
 activate(_Socket, _AssocId, Active) ->
     {error, {invalid_active, Active}}.
 
+-spec start_receive(socket:socket(), assoc_id(), pos_integer() | infinity, boolean()) -> result().
 start_receive(Socket, AssocId, Remaining, NotifyPassive) ->
     deactivate(Socket),
     case socket:setopt(Socket, {otp, select_read}, false) of
@@ -316,6 +409,7 @@ start_receive(Socket, AssocId, Remaining, NotifyPassive) ->
             Error
     end.
 
+-spec arm_receive(socket:socket(), assoc_id()) -> result().
 arm_receive(Socket, AssocId) ->
     case socket:recvmsg(Socket, 0, ?RECV_CTRL_SIZE, [], nowait) of
         {select, SelectInfo} ->
@@ -331,6 +425,7 @@ arm_receive(Socket, AssocId) ->
             ok
     end.
 
+-spec deactivate(socket:socket()) -> ok.
 deactivate(Socket) ->
     case erase(?RECV_STATE(Socket)) of
         #{select_info := SelectInfo} when SelectInfo =/= undefined ->
@@ -341,9 +436,20 @@ deactivate(Socket) ->
     _ = socket:setopt(Socket, {otp, select_read}, false),
     ok.
 
+-spec send(socket:socket(), assoc_id(), iodata()) -> result().
 send(Socket, _AssocId, Data) ->
     normalize_send_result(socket:send(Socket, Data)).
 
+-spec send(
+    socket:socket(),
+    assoc_id(),
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    [atom()],
+    binary()
+) -> result().
 send(Socket, AssocId, Stream, PPID, Context, TimeToLive, Flags, Data) ->
     Info = #{
         stream => Stream,
@@ -360,11 +466,13 @@ send(Socket, AssocId, Stream, PPID, Context, TimeToLive, Flags, Data) ->
         })
     ).
 
+-spec normalize_send_result(ok | {ok, binary() | erlang:iovec()} | {error, term()}) -> result().
 normalize_send_result(ok) -> ok;
 normalize_send_result({ok, []}) -> ok;
 normalize_send_result({ok, Rest}) -> {error, {partial_send, Rest}};
 normalize_send_result({error, _} = Error) -> Error.
 
+-spec decode_sctp(socket:socket(), assoc_id(), term()) -> decode_result().
 decode_sctp(Socket, AssocId, {'$socket', Socket, select, Handle}) ->
     case take_select_info(Socket, Handle) of
         true ->
@@ -389,6 +497,7 @@ decode_sctp(Socket, AssocId, {?MODULE, Socket, recv, AssocId, Result}) ->
 decode_sctp(_Socket, _AssocId, _Message) ->
     ignore.
 
+-spec decode_recv_result(socket:socket(), assoc_id(), recv_result()) -> decode_result().
 decode_recv_result(Socket, _AssocId, {select, SelectInfo}) ->
     store_select_info(Socket, SelectInfo),
     ignore;
@@ -405,11 +514,13 @@ decode_recv_result(Socket, AssocId, {error, Reason}) ->
 decode_recv_result(Socket, AssocId, Message) when is_map(Message) ->
     consume_message(Socket, AssocId, Message).
 
+-spec consume_message(socket:socket(), assoc_id(), socket:msg_recv()) -> decode_result().
 consume_message(Socket, AssocId, Message) ->
     Result = association_message(Message, AssocId),
     consume_credit(Socket),
     Result.
 
+-spec association_message(socket:msg_recv(), assoc_id()) -> decode_result().
 association_message(Message, AssocId) ->
     case socket_message(Message, AssocId) of
         {ok, {event, _RemoteAddr, _RemotePort, Event}} -> {ok, {event, Event}};
@@ -434,6 +545,8 @@ consume_credit(Socket) ->
             ok
     end.
 
+-spec continue_receive(socket:socket(), recv_state()) ->
+    ok | {?MODULE, socket:socket(), recv, assoc_id(), {error, term()}}.
 continue_receive(Socket, State) ->
     put(?RECV_STATE(Socket), State),
     case maps:get(select_info, State, undefined) of
@@ -448,12 +561,14 @@ continue_receive(Socket, State) ->
             ok
     end.
 
+-spec maybe_cancel_select(socket:socket(), recv_state()) -> ok.
 maybe_cancel_select(Socket, #{select_info := SelectInfo}) when SelectInfo =/= undefined ->
     _ = socket:cancel(Socket, SelectInfo),
     ok;
 maybe_cancel_select(_Socket, _State) ->
     ok.
 
+-spec store_select_info(socket:socket(), async_info()) -> recv_state() | ok.
 store_select_info(Socket, SelectInfo) ->
     case get(?RECV_STATE(Socket)) of
         State when is_map(State) ->
@@ -462,6 +577,7 @@ store_select_info(Socket, SelectInfo) ->
             ok
     end.
 
+-spec take_select_info(socket:socket(), reference()) -> boolean().
 take_select_info(Socket, Handle) ->
     case get(?RECV_STATE(Socket)) of
         #{select_info := SelectInfo} = State ->
@@ -476,14 +592,20 @@ take_select_info(Socket, Handle) ->
             false
     end.
 
+-spec select_handle(async_info() | undefined) -> reference() | undefined.
 select_handle({select_info, _Operation, Handle}) -> Handle;
 select_handle({completion_info, _Operation, Handle}) -> Handle;
 select_handle(_) -> undefined.
 
+-spec receive_error(socket:socket(), assoc_id(), term()) -> {ok, {event, term()}}.
 receive_error(Socket, AssocId, Reason) ->
     deactivate(Socket),
     {ok, {event, {socket_error, AssocId, Reason}}}.
 
+-spec socket_message(socket:msg_recv(), assoc_id() | undefined) ->
+    {ok, {event, inet:ip_address() | undefined, inet:port_number(), term()}}
+    | {ok, {data, inet:ip_address() | undefined, inet:port_number(), #sctp_sndrcvinfo{}, binary()}}
+    | ignore.
 socket_message(#{notification := Notification} = Message, _DefaultAssocId) ->
     {RemoteAddr, RemotePort} = remote(Message),
     {ok, {event, RemoteAddr, RemotePort, notification_record(Notification)}};
@@ -587,12 +709,16 @@ assoc_state(State) -> State.
 sockaddr_tuple(#{addr := Address, port := Port}) -> {Address, Port};
 sockaddr_tuple(Other) -> Other.
 
+-spec address_domain(inet:ip_address()) -> inet | inet6.
 address_domain(Address) when tuple_size(Address) =:= 4 -> inet;
 address_domain(Address) when tuple_size(Address) =:= 8 -> inet6.
 
+-spec sockaddr(inet | inet6, inet:ip_address(), inet:port_number()) ->
+    socket:sockaddr_in() | socket:sockaddr_in6().
 sockaddr(Domain, Address, Port) ->
     #{family => Domain, addr => Address, port => Port}.
 
+-spec default_assoc_id(assoc_id() | undefined) -> assoc_id().
 default_assoc_id(undefined) -> 0;
 default_assoc_id(AssocId) -> AssocId.
 
