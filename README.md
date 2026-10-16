@@ -49,6 +49,12 @@ metadata. The `socket` backend accepts positive Active-N values; the negative
 counter adjustments supported by `gen_sctp` are not part of esock's portable
 API.
 
+The `socket` backend reassembles partial receives into complete SCTP messages
+before consuming active credit. A partially received message is limited to
+16 MiB; exceeding that limit stops active delivery and reports
+`{socket_error, AssocId, {message_too_large, 16777216}}`. Close the association
+after this error.
+
 ## Basic use
 
 Start the application and acquire a listening socket:
@@ -220,6 +226,10 @@ receive
         error(Reason)
 end.
 ```
+
+The `connect_options` list uses the same reserved option rules as
+`socket_options`: active delivery, payload mode, local binding, socket type,
+and SCTP event subscriptions are managed by esock and cannot be overridden.
 
 Canceling an outgoing setup permits a new attempt to the same endpoint. The
 replacement gets its `ConnectRef` immediately. When the kernel has not assigned

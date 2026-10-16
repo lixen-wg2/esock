@@ -858,8 +858,14 @@ normalize_connect(RemoteAddrs0, RemotePort, Owner, ConnectOptions) when
     RemotePort =< 65535,
     is_list(ConnectOptions)
 ->
-    normalize_addresses(RemoteAddrs0);
+    case valid_socket_options(ConnectOptions) of
+        true -> normalize_addresses(RemoteAddrs0);
+        false -> invalid_connect_options(RemoteAddrs0, RemotePort, Owner, ConnectOptions)
+    end;
 normalize_connect(RemoteAddrs, RemotePort, Owner, ConnectOptions) ->
+    invalid_connect_options(RemoteAddrs, RemotePort, Owner, ConnectOptions).
+
+invalid_connect_options(RemoteAddrs, RemotePort, Owner, ConnectOptions) ->
     {error,
         {invalid_connect_options, #{
             remote_addrs => RemoteAddrs,

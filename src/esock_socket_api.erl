@@ -54,13 +54,17 @@
 -type decode_result() :: {ok, esock:decoded_sctp_message()} | ignore.
 -type recv_state() :: #{
     assoc_id := assoc_id(),
+    generation := reference(),
     remaining := pos_integer() | infinity,
     notify_passive := boolean(),
     select_info := async_info() | undefined
 }.
 
 -define(RECV_STATE(Socket), {?MODULE, recv_state, Socket}).
+%% Reassembly survives a temporary switch to passive mode.
+-define(RECV_PARTIAL(Socket), {?MODULE, recv_partial, Socket}).
 -define(RECV_CTRL_SIZE, 1024).
+-define(MAX_MESSAGE_SIZE, 16 * 1024 * 1024).
 
 -spec open(
     nonempty_list(inet:ip_address()),
@@ -189,6 +193,7 @@ socket_names(Socket, ConfiguredAddrs, ConfiguredPort) ->
 -spec close(socket:socket()) -> result().
 close(Socket) ->
     erase(?RECV_STATE(Socket)),
+    erase(?RECV_PARTIAL(Socket)),
     case socket:close(Socket) of
         ok -> ok;
         {error, closed} -> ok;
@@ -394,6 +399,7 @@ start_receive(Socket, AssocId, Remaining, NotifyPassive) ->
         ok ->
             put(?RECV_STATE(Socket), #{
                 assoc_id => AssocId,
+                generation => make_ref(),
                 remaining => Remaining,
                 notify_passive => NotifyPassive,
                 select_info => undefined
@@ -421,7 +427,8 @@ arm_receive(Socket, AssocId) ->
         {error, _} = Error ->
             Error;
         Result ->
-            self() ! {?MODULE, Socket, recv, AssocId, Result},
+            %% A queued result must not consume credit from a later activation.
+            self() ! {?MODULE, Socket, recv, AssocId, {receive_generation(Socket), Result}},
             ok
     end.
 
@@ -492,33 +499,99 @@ decode_sctp(Socket, AssocId, {'$socket', Socket, abort, {Handle, Reason}}) ->
         true -> receive_error(Socket, AssocId, Reason);
         false -> ignore
     end;
+decode_sctp(Socket, AssocId, {?MODULE, Socket, recv, AssocId, {Generation, Result}}) when
+    is_reference(Generation)
+->
+    decode_recv_result(Socket, AssocId, Generation, Result);
 decode_sctp(Socket, AssocId, {?MODULE, Socket, recv, AssocId, Result}) ->
     decode_recv_result(Socket, AssocId, Result);
 decode_sctp(_Socket, _AssocId, _Message) ->
     ignore.
 
 -spec decode_recv_result(socket:socket(), assoc_id(), recv_result()) -> decode_result().
-decode_recv_result(Socket, _AssocId, {select, SelectInfo}) ->
+decode_recv_result(Socket, AssocId, Result) ->
+    decode_recv_result(Socket, AssocId, receive_generation(Socket), Result).
+
+decode_recv_result(Socket, _AssocId, _Generation, {select, SelectInfo}) ->
     store_select_info(Socket, SelectInfo),
     ignore;
-decode_recv_result(Socket, _AssocId, {completion, CompletionInfo}) ->
+decode_recv_result(Socket, _AssocId, _Generation, {completion, CompletionInfo}) ->
     store_select_info(Socket, CompletionInfo),
     ignore;
-decode_recv_result(Socket, AssocId, {select_read, {SelectInfo, Message}}) ->
+decode_recv_result(Socket, AssocId, Generation, {select_read, {SelectInfo, Message}}) ->
     store_select_info(Socket, SelectInfo),
-    consume_message(Socket, AssocId, Message);
-decode_recv_result(Socket, AssocId, {ok, Message}) ->
-    consume_message(Socket, AssocId, Message);
-decode_recv_result(Socket, AssocId, {error, Reason}) ->
-    receive_error(Socket, AssocId, Reason);
-decode_recv_result(Socket, AssocId, Message) when is_map(Message) ->
-    consume_message(Socket, AssocId, Message).
+    consume_message(Socket, AssocId, Generation, Message);
+decode_recv_result(Socket, AssocId, Generation, {ok, Message}) ->
+    consume_message(Socket, AssocId, Generation, Message);
+decode_recv_result(Socket, AssocId, Generation, {error, Reason}) ->
+    case receive_generation(Socket) of
+        Generation -> receive_error(Socket, AssocId, Reason);
+        _ -> ignore
+    end;
+decode_recv_result(Socket, AssocId, Generation, Message) when is_map(Message) ->
+    consume_message(Socket, AssocId, Generation, Message).
 
--spec consume_message(socket:socket(), assoc_id(), socket:msg_recv()) -> decode_result().
-consume_message(Socket, AssocId, Message) ->
-    Result = association_message(Message, AssocId),
-    consume_credit(Socket),
-    Result.
+-spec consume_message(socket:socket(), assoc_id(), reference() | undefined, socket:msg_recv()) ->
+    decode_result().
+consume_message(Socket, AssocId, Generation, Message) ->
+    case assemble_message(Socket, AssocId, Message) of
+        pending ->
+            case get(?RECV_STATE(Socket)) of
+                #{generation := Generation} = State -> continue_receive(Socket, State);
+                _ -> ok
+            end,
+            ignore;
+        {error, Reason} ->
+            receive_error(Socket, AssocId, Reason);
+        Result ->
+            consume_credit(Socket, Generation),
+            Result
+    end.
+
+assemble_message(Socket, AssocId, #{notification := Notification} = Message) ->
+    case Notification of
+        #{type := partial_delivery} ->
+            erase(?RECV_PARTIAL(Socket));
+        #{type := partial_delivery_event} ->
+            erase(?RECV_PARTIAL(Socket));
+        #{type := shutdown_event} ->
+            erase(?RECV_PARTIAL(Socket));
+        #{type := assoc_change, state := State} when State =/= comm_up ->
+            erase(?RECV_PARTIAL(Socket));
+        _ ->
+            ok
+    end,
+    association_message(Message, AssocId);
+assemble_message(Socket, AssocId, #{iov := _, ctrl := _} = Message) ->
+    {ok, {data, RemoteAddr, RemotePort, Info, Data}} = association_message(Message, AssocId),
+    EOR = lists:member(eor, maps:get(flags, Message, [])),
+    case get(?RECV_PARTIAL(Socket)) of
+        undefined when byte_size(Data) > ?MAX_MESSAGE_SIZE ->
+            {error, {message_too_large, ?MAX_MESSAGE_SIZE}};
+        undefined when EOR ->
+            {ok, {data, RemoteAddr, RemotePort, Info, Data}};
+        undefined ->
+            put(?RECV_PARTIAL(Socket), {RemoteAddr, RemotePort, Info, [Data], byte_size(Data)}),
+            pending;
+        {FirstAddr, FirstPort, FirstInfo, Chunks, Size} ->
+            TotalSize = Size + byte_size(Data),
+            case TotalSize > ?MAX_MESSAGE_SIZE of
+                true ->
+                    erase(?RECV_PARTIAL(Socket)),
+                    {error, {message_too_large, ?MAX_MESSAGE_SIZE}};
+                false when EOR ->
+                    erase(?RECV_PARTIAL(Socket)),
+                    Payload = iolist_to_binary(lists:reverse([Data | Chunks])),
+                    {ok, {data, FirstAddr, FirstPort, FirstInfo, Payload}};
+                false ->
+                    put(?RECV_PARTIAL(Socket), {
+                        FirstAddr, FirstPort, FirstInfo, [Data | Chunks], TotalSize
+                    }),
+                    pending
+            end
+    end;
+assemble_message(_Socket, AssocId, Message) ->
+    association_message(Message, AssocId).
 
 -spec association_message(socket:msg_recv(), assoc_id()) -> decode_result().
 association_message(Message, AssocId) ->
@@ -527,13 +600,13 @@ association_message(Message, AssocId) ->
         Result -> Result
     end.
 
-consume_credit(Socket) ->
+consume_credit(Socket, Generation) ->
     case get(?RECV_STATE(Socket)) of
-        #{remaining := infinity} = State ->
+        #{generation := Generation, remaining := infinity} = State ->
             continue_receive(Socket, State);
-        #{remaining := Remaining} = State when Remaining > 1 ->
+        #{generation := Generation, remaining := Remaining} = State when Remaining > 1 ->
             continue_receive(Socket, State#{remaining => Remaining - 1});
-        #{notify_passive := NotifyPassive} = State ->
+        #{generation := Generation, notify_passive := NotifyPassive} = State ->
             maybe_cancel_select(Socket, State),
             erase(?RECV_STATE(Socket)),
             _ = socket:setopt(Socket, {otp, select_read}, false),
@@ -545,8 +618,7 @@ consume_credit(Socket) ->
             ok
     end.
 
--spec continue_receive(socket:socket(), recv_state()) ->
-    ok | {?MODULE, socket:socket(), recv, assoc_id(), {error, term()}}.
+-spec continue_receive(socket:socket(), recv_state()) -> ok.
 continue_receive(Socket, State) ->
     put(?RECV_STATE(Socket), State),
     case maps:get(select_info, State, undefined) of
@@ -555,10 +627,20 @@ continue_receive(Socket, State) ->
                 ok ->
                     ok;
                 {error, _} = Error ->
-                    self() ! {?MODULE, Socket, recv, maps:get(assoc_id, State), Error}
+                    self() !
+                        {?MODULE, Socket, recv, maps:get(assoc_id, State), {
+                            maps:get(generation, State), Error
+                        }},
+                    ok
             end;
         _ ->
             ok
+    end.
+
+receive_generation(Socket) ->
+    case get(?RECV_STATE(Socket)) of
+        #{generation := Generation} -> Generation;
+        _ -> undefined
     end.
 
 -spec maybe_cancel_select(socket:socket(), recv_state()) -> ok.
@@ -600,6 +682,7 @@ select_handle(_) -> undefined.
 -spec receive_error(socket:socket(), assoc_id(), term()) -> {ok, {event, term()}}.
 receive_error(Socket, AssocId, Reason) ->
     deactivate(Socket),
+    erase(?RECV_PARTIAL(Socket)),
     {ok, {event, {socket_error, AssocId, Reason}}}.
 
 -spec socket_message(socket:msg_recv(), assoc_id() | undefined) ->
@@ -675,6 +758,8 @@ notification_record(#{type := partial_delivery_event} = Notification) ->
         indication = maps:get(indication, Notification, partial_delivery_aborted),
         assoc_id = maps:get(assoc_id, Notification, 0)
     };
+notification_record(#{type := partial_delivery} = Notification) ->
+    notification_record(Notification#{type => partial_delivery_event});
 notification_record(Notification) ->
     Notification.
 

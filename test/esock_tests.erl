@@ -114,6 +114,30 @@ socket_backend_multiple_outgoing_associations_test_() ->
 socket_backend_active_n_test_() ->
     socket_test_case(fun socket_backend_active_n/0).
 
+socket_backend_large_record_once_test_() ->
+    socket_test_case(fun() -> socket_backend_large_records(once) end).
+
+socket_backend_large_record_active_n_test_() ->
+    socket_test_case(fun() -> socket_backend_large_records(2) end).
+
+socket_backend_partial_record_reset_test_() ->
+    socket_test_case(fun socket_backend_partial_record_reset/0).
+
+socket_backend_partial_record_metadata_test_() ->
+    socket_test_case(fun socket_backend_partial_record_metadata/0).
+
+socket_backend_partial_record_limit_test_() ->
+    socket_test_case(fun socket_backend_partial_record_limit/0).
+
+socket_backend_queued_reactivation_test_() ->
+    socket_test_case(fun socket_backend_queued_reactivation/0).
+
+reserved_connect_options_test_() ->
+    test_case(fun() -> reserved_connect_options(gen_sctp) end).
+
+socket_reserved_connect_options_test_() ->
+    socket_test_case(fun() -> reserved_connect_options(socket) end).
+
 socket_backend_reactivation_test_() ->
     socket_test_case(fun socket_backend_reactivation/0).
 
@@ -187,8 +211,8 @@ socket_configuration_conflict() ->
         })
     ),
     ?assertMatch(
-        {error, {socket_option_conflict,
-            #{reject_unmatched := false}, #{reject_unmatched := true}}},
+        {error,
+            {socket_option_conflict, #{reject_unmatched := false}, #{reject_unmatched := true}}},
         esock:open(#{
             local_addrs => [?LOOPBACK],
             local_port => Port,
@@ -395,8 +419,10 @@ peeled_close_notifies_peer(Backend) ->
     {Pending, _Info} = receive_pending(Peer),
     {ok, Assoc} = esock:accept(Socket, Pending, self()),
     ok = esock:close(Assoc),
-    ?assertMatch({ok, {_, _, [], #sctp_shutdown_event{}}},
-        sctp_recv(Client, ?TIMEOUT)),
+    ?assertMatch(
+        {ok, {_, _, [], #sctp_shutdown_event{}}},
+        sctp_recv(Client, ?TIMEOUT)
+    ),
     ok = gen_sctp:close(Client),
     ok = esock:release(Socket).
 
@@ -460,8 +486,10 @@ explicit_listener() ->
     ListenPort = free_port(),
     ClientPort = free_port(),
     {ok, Socket} = esock:open(#{
-        local_addrs => [?LOOPBACK], local_port => ListenPort,
-        start_listening => false, reject_unmatched => true
+        local_addrs => [?LOOPBACK],
+        local_port => ListenPort,
+        start_listening => false,
+        reject_unmatched => true
     }),
     {ok, ClosedClient} = client_socket(free_port()),
     assert_cannot_connect(ClosedClient, ListenPort),
@@ -487,11 +515,15 @@ shared_listener_lease() ->
 shared_listener_lease(Backend) ->
     ListenPort = free_port(),
     {ok, Socket1} = esock:open(#{
-        backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort,
+        backend => Backend,
+        local_addrs => [?LOOPBACK],
+        local_port => ListenPort,
         start_listening => false
     }),
     {ok, Socket2} = esock:open(#{
-        backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort,
+        backend => Backend,
+        local_addrs => [?LOOPBACK],
+        local_port => ListenPort,
         start_listening => true
     }),
     ?assertEqual(esock:socket_id(Socket1), esock:socket_id(Socket2)),
@@ -512,13 +544,16 @@ reject_unmatched_association() ->
     ListenPort = free_port(),
     ClientPort = free_port(),
     {ok, Socket} = esock:open(#{
-        local_addrs => [?LOOPBACK], local_port => ListenPort,
+        local_addrs => [?LOOPBACK],
+        local_port => ListenPort,
         reject_unmatched => true
     }),
     {ok, Client} = client_socket(ClientPort),
     _AssocId = connect_client(Client, ListenPort),
-    ?assertMatch({ok, {_, _, [], #sctp_shutdown_event{}}},
-        sctp_recv(Client, ?TIMEOUT)),
+    ?assertMatch(
+        {ok, {_, _, [], #sctp_shutdown_event{}}},
+        sctp_recv(Client, ?TIMEOUT)
+    ),
     {ok, Peer} = esock:register_peer(Socket, #{
         remote_addrs => [?LOOPBACK], remote_port => ClientPort
     }),
@@ -534,8 +569,7 @@ reject_unmatched_association() ->
 assert_cannot_connect(Client, Port) ->
     case gen_sctp:connect(Client, ?LOOPBACK, Port, [], 500) of
         {ok, #sctp_assoc_change{state = comm_up}} -> error(unexpected_connection);
-        {ok, {_, _, _, #sctp_assoc_change{state = comm_up}}} ->
-            error(unexpected_connection);
+        {ok, {_, _, _, #sctp_assoc_change{state = comm_up}}} -> error(unexpected_connection);
         _ -> ok
     end.
 
@@ -1038,6 +1072,216 @@ socket_backend_reactivation() ->
     ),
     close_all([Assoc], [Client], Socket).
 
+socket_backend_large_records(Active) ->
+    with_socket_association(fun(Assoc, Client, AssocId) ->
+        First = binary:copy(<<"first-record">>, 2000),
+        Second = binary:copy(<<"second-record">>, 1700),
+        Info = #sctp_sndrcvinfo{assoc_id = AssocId, stream = 2, ppid = 16#01020304},
+        ok = esock:activate(Assoc, Active),
+        ok = gen_sctp:send(Client, Info, First),
+        ok = gen_sctp:send(Client, Info#sctp_sndrcvinfo{ppid = 16#05060708}, Second),
+        ?assertMatch(
+            {ok, {data, _, _, #sctp_sndrcvinfo{stream = 2, ppid = 16#01020304}, First}},
+            receive_sctp_data(Assoc)
+        ),
+        AssocSocket = maps:get(socket, esock:association_info(Assoc)),
+        receive
+            {sctp_passive, AssocSocket} -> error(premature_passive)
+        after 0 ->
+            ok
+        end,
+        case Active of
+            once -> ok = esock:activate(Assoc, once);
+            2 -> ok
+        end,
+        ?assertMatch(
+            {ok, {data, _, _, #sctp_sndrcvinfo{stream = 2, ppid = 16#05060708}, Second}},
+            receive_sctp_data(Assoc)
+        ),
+        case Active of
+            once ->
+                ok;
+            2 ->
+                receive
+                    {sctp_passive, AssocSocket} -> ok
+                after ?TIMEOUT ->
+                    error(passive_timeout)
+                end
+        end,
+        ok = gen_sctp:send(Client, Info, <<"after-large-records">>),
+        ok = esock:activate(Assoc, once),
+        ?assertMatch(
+            {ok, {data, _, _, #sctp_sndrcvinfo{stream = 2}, <<"after-large-records">>}},
+            receive_sctp_data(Assoc)
+        )
+    end).
+
+socket_backend_partial_record_reset() ->
+    with_socket_association(fun(Assoc, _Client, _AssocId) ->
+        lists:foreach(
+            fun(Notification) ->
+                ?assertEqual(
+                    ignore,
+                    decode_socket_result(Assoc, #{
+                        iov => [<<"discarded">>], ctrl => [], flags => []
+                    })
+                ),
+                ?assertMatch(
+                    {ok, {event, _}},
+                    decode_socket_result(Assoc, #{notification => Notification})
+                ),
+                ?assertMatch(
+                    {ok, {data, _, _, _, <<"replacement">>}},
+                    decode_socket_result(Assoc, #{
+                        iov => [<<"replacement">>], ctrl => [], flags => [eor]
+                    })
+                )
+            end,
+            [
+                #{type => partial_delivery, indication => 0},
+                #{type => assoc_change, state => restart},
+                #{type => shutdown_event}
+            ]
+        )
+    end).
+
+socket_backend_partial_record_metadata() ->
+    with_socket_association(fun(Assoc, _Client, _AssocId) ->
+        <<NativePPID:32/native>> = <<16#01020304:32/big>>,
+        ?assertEqual(
+            ignore,
+            decode_socket_result(Assoc, #{
+                addr => #{family => inet, addr => ?LOOPBACK, port => 12345},
+                iov => [<<"first-">>],
+                flags => [],
+                ctrl => [
+                    #{
+                        level => sctp,
+                        type => sndrcv,
+                        value => #{
+                            stream => 3, ppid => NativePPID, flags => [unordered], context => 17
+                        }
+                    }
+                ]
+            })
+        ),
+        ?assertMatch(
+            {ok,
+                {data, ?LOOPBACK, 12345,
+                    #sctp_sndrcvinfo{
+                        stream = 3, ppid = 16#01020304, flags = [unordered], context = 17
+                    },
+                    <<"first-last">>}},
+            decode_socket_result(Assoc, #{iov => [<<"last">>], ctrl => [], flags => [eor]})
+        )
+    end).
+
+socket_backend_partial_record_limit() ->
+    with_socket_association(fun(Assoc, _Client, _AssocId) ->
+        Fragment = #{iov => [binary:copy(<<0>>, 8192)], ctrl => [], flags => []},
+        lists:foreach(
+            fun(_) -> ?assertEqual(ignore, decode_socket_result(Assoc, Fragment)) end,
+            lists:seq(1, 2048)
+        ),
+        ?assertMatch(
+            {ok, {event, {socket_error, _, {message_too_large, 16777216}}}},
+            decode_socket_result(Assoc, Fragment)
+        )
+    end).
+
+socket_backend_queued_reactivation() ->
+    with_socket_association(fun(Assoc, Client, AssocId) ->
+        AssocSocket = maps:get(socket, esock:association_info(Assoc)),
+        ok = client_send(Client, AssocId, 79, <<"already-buffered">>),
+        ok = wait_until(fun() ->
+            case socket:recvmsg(AssocSocket, 0, 1024, [peek], 0) of
+                {ok, #{iov := _}} -> true;
+                _ -> false
+            end
+        end),
+        ok = esock:activate(Assoc, once),
+        Queued =
+            receive
+                {esock_socket_api, AssocSocket, recv, _, _} = Message -> Message
+            after ?TIMEOUT ->
+                error(queued_receive_timeout)
+            end,
+        ok = esock:activate(Assoc, once),
+        {esock_socket_api, AssocSocket, recv, ServerAssocId, {OldGeneration, _}} = Queued,
+        ?assertEqual(
+            ignore,
+            esock:decode_sctp(Assoc, {
+                esock_socket_api, AssocSocket, recv, ServerAssocId, {OldGeneration, {error, closed}}
+            })
+        ),
+        ?assertMatch(
+            {ok, {data, _, _, _, <<"already-buffered">>}}, esock:decode_sctp(Assoc, Queued)
+        ),
+        ok = client_send(Client, AssocId, 79, <<"new-credit">>),
+        ?assertMatch({ok, {data, _, <<"new-credit">>}}, receive_data(Assoc))
+    end).
+
+with_socket_association(Test) ->
+    {ok, Socket} = esock:open(#{backend => socket, local_addrs => [?LOOPBACK], local_port => 0}),
+    {ok, {_, ListenPort}} = esock:socknames(Socket),
+    {ok, Peer} = esock:register_peer(Socket, #{remote_addrs => [?LOOPBACK]}),
+    {ok, Client} = client_socket(0),
+    AssocId = connect_client(Client, ListenPort),
+    {Pending, _Info} = receive_pending(Peer),
+    {ok, Assoc} = esock:accept(Socket, Pending, self()),
+    try
+        Test(Assoc, Client, AssocId)
+    after
+        close_all([Assoc], [Client], Socket)
+    end.
+
+decode_socket_result(Assoc, Result) ->
+    #{socket := Socket, assoc_id := AssocId} = esock:association_info(Assoc),
+    esock:decode_sctp(Assoc, {esock_socket_api, Socket, recv, AssocId, Result}).
+
+reserved_connect_options(Backend) ->
+    ListenPort = free_port(),
+    OpenOptions = #{backend => Backend, local_addrs => [?LOOPBACK], local_port => ListenPort},
+    {ok, Socket} = esock:open(OpenOptions),
+    {ok, OtherLease} = esock:open(OpenOptions),
+    {ok, Peer} = esock:register_peer(OtherLease, #{remote_addrs => [?LOOPBACK]}),
+    {ok, Server} = server_socket(0),
+    {ok, ServerPort} = inet:port(Server),
+    Options = #{remote_addrs => [?LOOPBACK], remote_port => ServerPort},
+    lists:foreach(
+        fun(Reserved) ->
+            ?assertMatch(
+                {error, {invalid_connect_options, _}},
+                esock:connect(Socket, Options#{connect_options => [Reserved]})
+            )
+        end,
+        [
+            {active, false},
+            binary,
+            list,
+            {mode, list},
+            {ip, ?LOOPBACK},
+            {ifaddr, ?LOOPBACK},
+            {port, 0},
+            {type, stream},
+            {sctp_events, #sctp_event_subscribe{association_event = false}}
+        ]
+    ),
+    {ok, ConnectRef} = esock:connect(Socket, Options#{
+        connect_options => [{sctp_initmsg, #sctp_initmsg{num_ostreams = 3}}]
+    }),
+    Outgoing = receive_connected(ConnectRef),
+    {ok, {_, ListenPort, _, #sctp_assoc_change{state = comm_up}}} = sctp_recv(Server, ?TIMEOUT),
+    {ok, Client} = client_socket(0),
+    AssocId = connect_client(Client, ListenPort),
+    {Pending, _PeerInfo} = receive_pending(Peer),
+    {ok, Incoming} = esock:accept(OtherLease, Pending, self()),
+    ok = esock:activate(Incoming, once),
+    ok = client_send(Client, AssocId, 80, <<"listener-still-active">>),
+    ?assertMatch({ok, {data, _, <<"listener-still-active">>}}, receive_data(Incoming)),
+    close_all([Outgoing, Incoming], [Client, Server], Socket),
+    ok = esock:release(OtherLease).
+
 socket_backend_default_send_parameters() ->
     ListenPort = free_port(),
     ClientPort = free_port(),
@@ -1094,13 +1338,11 @@ invalid_socket_options() ->
         invalid_esock_call(open, [#{pending_timeout => 0}])
     ),
     ?assertMatch(
-        {error, {invalid_socket_options,
-            #{start_listening := invalid, reject_unmatched := false}}},
+        {error, {invalid_socket_options, #{start_listening := invalid, reject_unmatched := false}}},
         invalid_esock_call(open, [#{start_listening => invalid}])
     ),
     ?assertMatch(
-        {error, {invalid_socket_options,
-            #{start_listening := true, reject_unmatched := invalid}}},
+        {error, {invalid_socket_options, #{start_listening := true, reject_unmatched := invalid}}},
         invalid_esock_call(open, [#{reject_unmatched => invalid}])
     ),
     {ok, Socket} = esock:open(#{local_addrs => [?LOOPBACK], local_port => free_port()}),
